@@ -1,7 +1,7 @@
 ## Overview
 This document explains motion data of this robot movement shown in the video below. The data is stored in `robot_trajectory.npz` file. The robot has 6 joints that move in different ways.
 
-<div><video controls src="robot_movement.mp4" muted="false"></video></div>
+https://github.com/user-attachments/assets/66353505-3ed9-4e9e-90b2-fb54ff5d01c5
 
 ## Joint Configuration
 When you load the trajectory data using `np.load('robot_trajectory.npz')`, the `joint_angles` array shows how each joint moves over time.
