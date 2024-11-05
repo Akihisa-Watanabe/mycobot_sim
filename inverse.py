@@ -33,10 +33,10 @@ class RobotController:
         if target_position is not None:
             self.target_pos = np.array(target_position, dtype=np.float64)
         else:
-            self.target_pos = np.array([0.3, 0.0, 0.5], dtype=np.float64)
+            self.target_pos = np.array([0.3, 0.0, 3.5], dtype=np.float64)
             
         # Control parameters
-        self.position_threshold = 0.1
+        self.position_threshold = 0.01
         self.time_at_target = 0.0
         self.time_threshold = 0.5
         
@@ -187,7 +187,7 @@ class RobotController:
 
 def main():
     model_path = "config/xml/mycobot_280jn_mujoco.xml"
-    target_position = [0.19425692, -0.18526572, 0.13998125]
+    target_position = [0.19425692, -0.18526572, 0.2]
     
     try:
         controller = RobotController(model_path, target_position)
