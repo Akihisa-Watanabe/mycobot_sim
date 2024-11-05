@@ -4,183 +4,197 @@ import time
 import mediapy as media
 
 class RobotController:
-    def __init__(self, model_path):
-        # MuJoCoモデルの読み込み
-        self.model = mujoco.MjModel.from_xml_path(model_path)
-        self.data = mujoco.MjData(self.model)
-        
-        # 初期化
-        self.damping = 0.5  # ダンピングを小さくして動作を速く
-        self.max_vel = 10.0  # 最大速度を上げる
+    def __init__(self, model_path, target_position=None):
+        try:
+            # MuJoCo model loading with error handling
+            self.model = mujoco.MjModel.from_xml_path(model_path)
+            self.data = mujoco.MjData(self.model)
+            
+            # Set model parameters for better visualization
+            self.model.vis.global_.offwidth = 1920
+            self.model.vis.global_.offheight = 1080
+            
+        except Exception as e:
+            raise RuntimeError(f"Failed to load MuJoCo model: {e}")
+            
+        # Initialize parameters
+        self.damping = 0.01
+        self.max_vel = 500.0
         self.nv = self.model.nv
         
-        # レンダリング用の設定
-        self.render_resolution = (480, 360)
+        # Enhanced rendering settings
+        self.duration = float(7)
+        self.framerate = int(60)
         self.frames = []
-        self.renderer = mujoco.Renderer(self.model, height=self.render_resolution[1], 
-                                      width=self.render_resolution[0])
+        self.render_width = 1920
+        self.render_height = 1080
         
-        # カメラの設定
-        self.cam = mujoco.MjvCamera()
-        self.cam.type = mujoco.mjtCamera.mjCAMERA_FREE
-        self.cam.distance = 1.5
-        self.cam.azimuth = 90
-        self.cam.elevation = -45
-        self.cam.lookat = np.array([0, 0, 0.5])
+        # Target position setup with validation
+        if target_position is not None:
+            self.target_pos = np.array(target_position, dtype=np.float64)
+        else:
+            self.target_pos = np.array([0.3, 0.0, 0.5], dtype=np.float64)
+            
+        # Control parameters
+        self.position_threshold = 0.1
+        self.time_at_target = 0.0
+        self.time_threshold = 0.5
         
-        # シーンとオプションの初期化
-        self.scene = mujoco.MjvScene(self.model, maxgeom=100)
-        self.opt = mujoco.MjvOption()
-        
-        # 軌道の生成
-        self.trajectory = self.generate_trajectory()
-        self.trajectory_index = 0
-        self.target_pos = self.trajectory[0]
-        
-        # 軌道追従の制御パラメータ
-        self.position_threshold = 0.05  # 位置誤差の閾値を大きく
-        self.time_per_point = 0.05     # 各点での滞在時間を短く
-        self.time_at_current_point = 0
-        
-        # シミュレーション完了フラグ
+        # Simulation state
         self.is_running = True
-    
-    def generate_trajectory(self):
-        """単純化された軌道生成（少ない点数の四角形）"""
-        points = [
-            [0.3, 0.2, 0.5],   # 右前
-            [0.3, -0.2, 0.5],  # 右後
-            [0.1, -0.2, 0.5],  # 左後
-            [0.1, 0.2, 0.5],   # 左前
-        ]
         
-        # 各辺を5点で補間（合計20点）
-        trajectory = []
-        for i in range(len(points)):
-            start = np.array(points[i])
-            end = np.array(points[(i+1) % len(points)])
-            for t in np.linspace(0, 1, 5):
-                trajectory.append(start * (1-t) + end * t)
-                
-        return trajectory
-
+        # バリデーションを実行
+        self.validate_initial_state()
+    
+    def validate_initial_state(self):
+        """初期状態の検証"""
+        if self.target_pos.shape != (3,):
+            raise ValueError("Target position must be a 3D vector")
+        if not isinstance(self.duration, (int, float)) or self.duration <= 0:
+            raise ValueError("Duration must be a positive number")
+        if not isinstance(self.framerate, int) or self.framerate <= 0:
+            raise ValueError("Framerate must be a positive integer")
     
     def get_jacobian(self):
         """ヤコビ行列の計算"""
         jacp = np.zeros((3, self.nv))
         jacr = np.zeros((3, self.nv))
         
-        body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "joint6_flange")
-        mujoco.mj_jac(self.model, self.data, jacp, jacr, self.data.xpos[body_id], body_id)
+        try:
+            body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "joint6_flange")
+            mujoco.mj_jac(self.model, self.data, jacp, jacr, self.data.xpos[body_id], body_id)
+        except Exception as e:
+            raise RuntimeError(f"Failed to compute Jacobian: {e}")
         
         return jacp
     
     def get_end_effector_pos(self):
         """エンドエフェクタの現在位置を取得"""
-        body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "joint6_flange")
-        return self.data.xpos[body_id]
+        try:
+            body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "joint6_flange")
+            return np.array(self.data.xpos[body_id])
+        except Exception as e:
+            raise RuntimeError(f"Failed to get end effector position: {e}")
     
     def solve_ik(self):
-        """インバース・キネマティクスの計算"""
-        current_pos = self.get_end_effector_pos()
-        error = self.target_pos - current_pos
-        
-        J = self.get_jacobian()
-        JT = J.T
-        lambda_squared = self.damping ** 2
-        joint_vel = JT @ np.linalg.solve(J @ JT + lambda_squared * np.eye(3), error)
-        
-        norm = np.linalg.norm(joint_vel)
-        if norm > self.max_vel:
-            joint_vel = joint_vel * self.max_vel / norm
+        """インバース・キネマティクスを解く"""
+        try:
+            current_pos = self.get_end_effector_pos()
+            error = self.target_pos - current_pos
             
-        return joint_vel, np.linalg.norm(error)
+            J = self.get_jacobian()
+            JT = J.T
+            lambda_squared = self.damping ** 2
+            
+            JJT = J @ JT
+            damped_inversion = JJT + lambda_squared * np.eye(3)
+            joint_vel = JT @ np.linalg.solve(damped_inversion, error)
+            
+            norm = np.linalg.norm(joint_vel)
+            if norm > self.max_vel:
+                joint_vel = joint_vel * self.max_vel / norm
+                
+            return joint_vel, float(np.linalg.norm(error))
+            
+        except Exception as e:
+            raise RuntimeError(f"IK solving failed: {e}")
     
-    def update_target(self, dt):
-        """目標位置の更新"""
-        current_error = np.linalg.norm(self.target_pos - self.get_end_effector_pos())
-        self.time_at_current_point += dt
-        
-        if current_error < self.position_threshold and self.time_at_current_point >= self.time_per_point:
-            self.trajectory_index = (self.trajectory_index + 1) % len(self.trajectory)
-            self.target_pos = self.trajectory[self.trajectory_index]
-            self.time_at_current_point = 0
-            return True
-        return False
+    def check_target_reached(self, dt, error):
+        """目標位置到達判定"""
+        try:
+            dt = float(dt)
+            error = float(error)
+            
+            if error < self.position_threshold:
+                self.time_at_target += dt
+                return self.time_at_target >= self.time_threshold
+            else:
+                self.time_at_target = 0
+            return False
+        except Exception as e:
+            raise RuntimeError(f"Target check failed: {e}")
 
     def run(self):
-        """メインループ"""
-        print("Starting trajectory following...")
+        """メインシミュレーションループ"""
+        print("Moving to target position...")
+        print(f"Target position: {self.target_pos}")
         
-        while self.is_running:
-            time_start = time.time()
+        try:
+            # データリセット
+            mujoco.mj_resetDataKeyframe(self.model, self.data, 0)
+            
+            # レンダラーの作成（高解像度設定）
+            renderer = mujoco.Renderer(self.model, self.render_height, self.render_width)
             
             try:
-                # IKを解いて関節速度を取得
-                joint_vel, error = self.solve_ik()
-                self.data.qvel[:self.nv] = joint_vel
+                # 追加のレンダリング設定
+                renderer.enable_shadows = True
                 
-                # シミュレーションステップ
-                mujoco.mj_step(self.model, self.data)
+                last_render_time = 0.0
                 
-                # 目標位置の更新
-                point_updated = self.update_target(1/60.0)
+                while self.is_running and self.data.time < self.duration:
+                    time_start = time.time()
+                    
+                    # IKを解いて関節速度を更新
+                    joint_vel, error = self.solve_ik()
+                    self.data.qvel[:self.nv] = joint_vel
+                    
+                    # シミュレーションステップ
+                    mujoco.mj_step(self.model, self.data)
+                    
+                    # フレーム取得
+                    current_frame_time = int(self.data.time * self.framerate)
+                    if current_frame_time > last_render_time:
+                        renderer.update_scene(self.data)
+                        pixels = renderer.render()
+                        self.frames.append(pixels)
+                        last_render_time = current_frame_time
+                    
+                    # 状態更新
+                    current_pos = self.get_end_effector_pos()
+                    print(f"\rTime: {self.data.time:.2f}s, Error: {error:.3f}m, Current: {current_pos.round(3)}", end="")
+                    
+                    # 目標位置到達判定
+                    if self.check_target_reached(1.0/self.framerate, error):
+                        print("\nTarget position reached!")
+                        break
+                    
+                    # フレームレート制御
+                    time_to_wait = 1.0/self.framerate - (time.time() - time_start)
+                    if time_to_wait > 0:
+                        time.sleep(time_to_wait)
+            
+            finally:
+                renderer.close()
+            
+            # ビデオ処理（高品質設定）
+            if self.frames:
+                print("\nDisplaying video...")
+                media.show_video(self.frames, fps=self.framerate)
                 
+                print("\nSaving video...")
                 try:
-                    # シーンの更新とレンダリング
-                    mujoco.mjv_updateScene(
-                        self.model,
-                        self.data,
-                        self.opt,
-                        None,
-                        self.cam,
-                        mujoco.mjtCatBit.mjCAT_ALL.value,
-                        self.scene
-                    )
-                    self.renderer.update_scene(self.data, self.cam)
-                    pixels = self.renderer.render()
-                    self.frames.append(pixels)
-                except Exception as render_error:
-                    print(f"\nRendering error: {render_error}")
-                    raise render_error
-                
-                # 現在の状態を表示
-                current_pos = self.get_end_effector_pos()
-                print(f"\rPoint: {self.trajectory_index:3d}/{len(self.trajectory):3d}, "
-                      f"Error: {error:.3f}m, "
-                      f"Target: {self.target_pos.round(3)}, "
-                      f"Current: {current_pos.round(3)}", end="")
-                
-                # 1周完了で終了
-                if self.trajectory_index == len(self.trajectory) - 1 and error < self.position_threshold:
-                    self.is_running = False
-                
-            except Exception as e:
-                print(f"\nError during simulation: {e}")
-                break
-            
-            # フレームレート制御
-            time_to_wait = 1/60 - (time.time() - time_start)
-            if time_to_wait > 0:
-                time.sleep(time_to_wait)
-        
-        # 動画の保存
-        if self.frames:
-            print("\nSaving video...")
-            try:
-                import imageio
-                imageio.mimsave('robot_trajectory.mp4', self.frames, fps=60)
-                print("Video saved as robot_trajectory.mp4")
-            except Exception as e:
-                print(f"Error saving video: {e}")
+                    import imageio
+                    imageio.mimsave('robot_movement.mp4', self.frames, fps=self.framerate, 
+                                  quality=10, bitrate="32M")
+                    print("Video saved as robot_movement.mp4")
+                except Exception as e:
+                    print(f"Error saving video: {e}")
+                    
+        except Exception as e:
+            print(f"\nSimulation error: {e}")
+            raise
 
 def main():
     model_path = "config/xml/mycobot_280jn_mujoco.xml"
+    target_position = [0.19425692, -0.18526572, 0.13998125]
+    
     try:
-        controller = RobotController(model_path)
+        controller = RobotController(model_path, target_position)
         controller.run()
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"Fatal error: {e}")
+        raise
 
 if __name__ == "__main__":
     main()
