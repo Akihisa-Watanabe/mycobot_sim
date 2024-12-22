@@ -114,7 +114,7 @@ def visualize(model, data, cam_distance, cam_azimuth, cam_elevation, cam_lookat,
 
 def main():
     parser = argparse.ArgumentParser(description="MuJoCo Robot Visualization") #[0.0, np.pi/4, -np.pi/6, np.pi/3, -np.pi/2, np.pi/6]
-    parser.add_argument("--joint_angles", type=float, nargs=6, default=[0.0, 0, 0, 0, 0, 0],
+    parser.add_argument("--joint_angles", type=float, nargs=6, default=[0.0, -np.pi/4, -np.pi/6, -np.pi/3, -np.pi/2, -np.pi/6],
                         help="Joint angles in radians for the 6 joints, e.g. --joint_angles 0.0 0.78 -0.52 1.04 -1.57 0.52")
     parser.add_argument("--cam_distance", type=float, default=1.0, help="Camera distance from the scene center")
     parser.add_argument("--cam_azimuth", type=float, default=-145, help="Camera azimuth angle in degrees")
@@ -146,10 +146,10 @@ def main():
     print("MuJoCo End-Effector Position:", mj_pos)
 
     # Get the ID of the target site
-    site_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "target")
+    # site_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "target")
 
     # Move the target site to the computed FK position
-    model.site_pos[site_id] = fk_pos
+    # model.site_pos[site_id] = fk_pos
 
     # Update the simulation
     mujoco.mj_forward(model, data)
