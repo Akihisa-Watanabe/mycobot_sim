@@ -345,6 +345,176 @@ def set_joint_angles(data, thetas):
     for i in range(len(thetas)):
         data.qpos[i] = thetas[i]
 
+def calculate_workspace_limits():
+    """
+    Calculate approximate workspace limits of the robot based on link lengths.
+    Returns min_reach and max_reach.
+    """
+    # Extract link lengths from DH parameters
+    # Values from the DH parameters in the code
+    link_lengths = [0.15708, 0.1104, 0.096, 0.06639, 0.07318, 0.0456]
+    
+    # Calculate maximum reach by summing all link lengths
+    # This is a theoretical maximum - the actual reach will be less due to joint limits
+    max_reach = sum(link_lengths) * 0.9  # 90% of theoretical maximum
+    
+    # Minimum reach - approximation based on robot geometry
+    min_reach = 0.12  # Simplified minimum reach (robot base radius + safety margin)
+    
+    return min_reach, max_reach
+
+def is_point_reachable(target_pos, target_orientation, thetas_init=None):
+    """
+    Check if a target position and orientation is reachable.
+    
+    Args:
+        target_pos: Target position [x, y, z]
+        target_orientation: Target orientation [alpha, beta, gamma]
+        thetas_init: Initial joint angles to start the IK from
+        
+    Returns:
+        (reachable, thetas): A tuple containing a boolean indicating if the target is reachable
+                             and the joint angles if reachable
+    """
+    if thetas_init is None:
+        thetas_init = np.zeros(6)
+    
+    target_pose = np.concatenate([target_pos, target_orientation])
+    
+    # Get rough workspace limits based on link lengths
+    min_reach, max_reach = calculate_workspace_limits()
+    
+    # Rough check: Is the target within a reasonable distance?
+    distance = np.linalg.norm(target_pos)
+    if distance < min_reach * 0.8 or distance > max_reach * 1.1:
+        return False, None
+    
+    # Try to find an IK solution
+    try:
+        thetas = inverse_kinematics(thetas_init, target_pose, max_iterations=200, step_size=0.01)
+        
+        # Verify the solution by computing forward kinematics
+        achieved_pose = forward_kinematics(thetas)
+        
+        # Calculate errors
+        pos_error = np.linalg.norm(achieved_pose[:3] - target_pos)
+        orient_error = np.linalg.norm(unwrap_angles(achieved_pose[3:], target_orientation) - target_orientation)
+        
+        # Check if the solution is accurate enough
+        if pos_error < 0.01 and orient_error < 0.1:
+            return True, thetas
+        else:
+            return False, None
+    except Exception:
+        return False, None
+
+def find_closest_reachable_target(target_pos, target_orientation, num_samples=10):
+    """
+    Find the closest reachable target to the specified target position and orientation.
+    Uses a sampling-based approach to find a valid target.
+    
+    Args:
+        target_pos: Target position [x, y, z]
+        target_orientation: Target orientation [alpha, beta, gamma]
+        num_samples: Number of samples to try when searching
+        
+    Returns:
+        (closest_pos, closest_orientation): The closest reachable position and orientation
+    """
+    # Get the direction vector from origin to target
+    distance = np.linalg.norm(target_pos)
+    if distance < 1e-6:
+        # If target is at origin, choose a default direction
+        direction = np.array([0, 0, 1])
+    else:
+        direction = target_pos / distance
+    
+    # Get rough workspace limits
+    min_reach, max_reach = calculate_workspace_limits()
+    
+    # If target is too far, scale it back
+    if distance > max_reach:
+        # Try points at different distances along the same direction
+        for scale in np.linspace(0.9, 0.5, num_samples):
+            test_pos = direction * (max_reach * scale)
+            reachable, _ = is_point_reachable(test_pos, target_orientation)
+            if reachable:
+                return test_pos, target_orientation
+        
+        # If still not found, try with different orientations
+        for scale in np.linspace(0.9, 0.5, 5):
+            test_pos = direction * (max_reach * scale)
+            # Try different orientations (simplistic approach - just rotate around z)
+            for angle in np.linspace(0, np.pi, 5):
+                test_orientation = np.array([angle, 0, 0])
+                reachable, _ = is_point_reachable(test_pos, test_orientation)
+                if reachable:
+                    return test_pos, test_orientation
+    
+    # If target is too close, move it outward
+    elif distance < min_reach:
+        for scale in np.linspace(1.2, 2.0, num_samples):
+            test_pos = direction * (min_reach * scale)
+            reachable, _ = is_point_reachable(test_pos, target_orientation)
+            if reachable:
+                return test_pos, target_orientation
+        
+        # If still not found, try with different orientations
+        for scale in np.linspace(1.2, 2.0, 5):
+            test_pos = direction * (min_reach * scale)
+            for angle in np.linspace(0, np.pi, 5):
+                test_orientation = np.array([angle, 0, 0])
+                reachable, _ = is_point_reachable(test_pos, test_orientation)
+                if reachable:
+                    return test_pos, test_orientation
+    
+    # If distance is within bounds but still unreachable, try scaling back slightly
+    else:
+        # Try points at slightly different distances along the same direction
+        for scale in np.linspace(0.95, 0.5, num_samples):
+            test_pos = direction * (distance * scale)
+            reachable, _ = is_point_reachable(test_pos, target_orientation)
+            if reachable:
+                return test_pos, target_orientation
+        
+        # If still not found, try with different orientations
+        for scale in np.linspace(0.95, 0.5, 5):
+            test_pos = direction * (distance * scale)
+            for angle in np.linspace(0, np.pi, 5):
+                test_orientation = np.array([angle, 0, 0])
+                reachable, _ = is_point_reachable(test_pos, test_orientation)
+                if reachable:
+                    return test_pos, test_orientation
+    
+    # Fallback - return a safe position and orientation that's likely reachable
+    fallback_pos = direction * min_reach * 1.5  # 50% beyond minimum reach
+    fallback_orientation = np.zeros(3)  # Default orientation
+    
+    return fallback_pos, fallback_orientation
+
+def validate_and_adjust_target(target_pos, target_orientation):
+    """
+    Validate if the target is reachable, and if not, adjust it to the closest reachable position.
+    
+    Args:
+        target_pos: Target position [x, y, z]
+        target_orientation: Target orientation [alpha, beta, gamma]
+        
+    Returns:
+        (adjusted_pos, adjusted_orientation, reachable): 
+            Adjusted position, orientation and a flag indicating if the original target was reachable
+    """
+    # Check if the target is reachable
+    reachable, _ = is_point_reachable(target_pos, target_orientation)
+    
+    if reachable:
+        return target_pos, target_orientation, True
+    else:
+        # Find the closest reachable target
+        closest_pos, closest_orientation = find_closest_reachable_target(
+            target_pos, target_orientation)
+        
+        return closest_pos, closest_orientation, False
 ###############################################################################
 # 3) Target Visualization Functions
 ###############################################################################
@@ -768,6 +938,7 @@ def main():
     parser.add_argument('--x', type=float, default=0.05826, help='Target position X (default: 0.06026)')
     parser.add_argument('--y', type=float, default=-0.2752, help='Target position Y (default: -0.2752)')
     parser.add_argument('--z', type=float, default=0.1566 , help='Target position Z (default: 0.0566)')
+    
     # Target orientation arguments (in radians)
     parser.add_argument('--alpha', type=float, default=0.0, help='Target orientation Alpha - rotation around Z axis (default: 0.0)')
     parser.add_argument('--beta', type=float, default=0.0, help='Target orientation Beta - rotation around Y axis (default: 0.0)')
@@ -779,11 +950,36 @@ def main():
     # Interactive mode flag
     parser.add_argument('--interactive', action='store_true', help='Run in interactive mode (default: False)')
     
+    # Workspace checking flag
+    parser.add_argument('--skip-check', action='store_true', help='Skip workspace checking (default: False)')
+    
     args = parser.parse_args()
     
     # Create target position and orientation arrays
-    target_pos = np.array([args.x, args.y, args.z])
-    target_orientation = np.array([args.alpha, args.beta, args.gamma])
+    original_target_pos = np.array([args.x, args.y, args.z])
+    original_target_orientation = np.array([args.alpha, args.beta, args.gamma])
+    
+    # Validate and adjust the target if needed
+    if not args.skip_check:
+        print("\nChecking if target is within reachable workspace...")
+        target_pos, target_orientation, was_reachable = validate_and_adjust_target(
+            original_target_pos, original_target_orientation)
+        
+        # Print information about the target
+        if not was_reachable:
+            print("\nWarning: Original target is not reachable!")
+            print(f"Original target position: {original_target_pos}")
+            print(f"Original target orientation: {original_target_orientation}")
+            print(f"Adjusted to closest reachable target position: {target_pos}")
+            print(f"Adjusted target orientation: {target_orientation}")
+        else:
+            print("\nTarget is reachable.")
+            print(f"Target position: {target_pos}")
+            print(f"Target orientation: {target_orientation}")
+    else:
+        print("\nSkipping workspace checking as requested.")
+        target_pos = original_target_pos
+        target_orientation = original_target_orientation
     
     # Run in appropriate mode
     if args.interactive:
