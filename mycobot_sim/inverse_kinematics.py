@@ -93,23 +93,19 @@ def analytic_jacobian(thetas):
 
 def inverse_kinematics_simple(thetas_init, x_desired, 
                               fk_func, 
-                              max_iterations=100, 
-                              tolerance=1e-4):
+                              ):
     """
     Simple iterative IK using a first-order (Jacobian-based) approach (position only).
     """
     thetas = np.array(thetas_init, dtype=float)
 
-    for _ in range(max_iterations):
-        T = fk_func(thetas)
-        x_current = T[:3, 3]
-        error = x_desired - x_current
-        if np.linalg.norm(error) < tolerance:
-            break
-
-        J = analytic_jacobian(thetas)
-        dtheta = np.linalg.pinv(J) @ error
-        thetas += dtheta
+    T = fk_func(thetas)
+    x_current = T[:3, 3]
+    error = x_desired - x_current
+    J = analytic_jacobian(thetas)
+    J_inv = np.linalg.pinv(J)
+    dtheta = J_inv @ error
+    thetas += dtheta
 
     return thetas
 
@@ -148,7 +144,7 @@ def main():
 
     # Our DH-based initial EE position
     x_init = forward_kinematics_debug(thetas_init)[:3, 3]
-    x_target = np.array([0.2225, -0.1102,  0.2077])
+    x_target = np.array([ 0.05826, -0.1752,  0.3566 ])
     n_steps = 100
     waypoints = interpolate_linear(x_init, x_target, n_steps)
 
