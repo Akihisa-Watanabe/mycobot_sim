@@ -88,8 +88,6 @@ def forward_kinematics(thetas):
 
 def euler_angle_from_matrix(T):
     """Calculate Euler angles (ZYZ) from transformation matrix."""
-    # This function remains the same as the original implementation
-    # but we keep it for clarity and consistency
     alpha = math.atan2(T[1, 2], T[0, 2])
     if not (-math.pi/2 <= alpha <= math.pi/2):
         alpha = math.atan2(T[1, 2], T[0, 2]) + math.pi
