@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-ターゲット位置と姿勢を可視化するロボットアームデモ
-ユーザーが指定した位置と姿勢にロボットアームを動かし、その過程を可視化します。
-元のFK/IK実装を維持しています。
+Robot arm demo visualizing target position and orientation
+Moves the robot arm to user-specified position and orientation, visualizing the process.
+Maintains the original FK/IK implementation with improved Euler angle handling.
 """
 
 import mujoco
@@ -16,7 +16,7 @@ from pathlib import Path
 import re
 
 ###############################################################################
-# 1) DH-based FK, Jacobian, and IK - 元の実装を保持
+# 1) DH-based FK, Jacobian, and IK - Maintaining original implementation
 ###############################################################################
 def dh_transform(a, alpha, d, theta):
     """Compute the Denavit-Hartenberg transformation matrix.
@@ -98,23 +98,68 @@ def forward_kinematics(thetas):
     
     return np.array([x, y, z, alpha, beta, gamma])
 
+def unwrap_angles(angles, reference=None):
+    """
+    Unwrap angles to ensure continuous motion without jumps.
+    When reference is provided, unwraps angles to be nearest to reference values.
+    
+    Args:
+        angles: Array of angles to unwrap
+        reference: Optional reference angles for consistent unwrapping
+    
+    Returns:
+        Unwrapped angles with minimized discontinuities
+    """
+    unwrapped = np.array(angles)
+    
+    if reference is not None:
+        # Unwrap relative to reference angles
+        for i in range(len(unwrapped)):
+            # Calculate difference and ensure it's in [-pi, pi]
+            diff = unwrapped[i] - reference[i]
+            diff = ((diff + math.pi) % (2 * math.pi)) - math.pi
+            
+            # Apply the adjusted difference
+            unwrapped[i] = reference[i] + diff
+    else:
+        # Ensure all angles are in [-pi, pi] range
+        for i in range(len(unwrapped)):
+            unwrapped[i] = ((unwrapped[i] + math.pi) % (2 * math.pi)) - math.pi
+            
+    return unwrapped
+
 def euler_angle_from_matrix(T):
-    """Calculate Euler angles (ZYZ) from transformation matrix."""
-    alpha = math.atan2(T[1, 2], T[0, 2])
-    if not (-math.pi/2 <= alpha <= math.pi/2):
-        alpha = math.atan2(T[1, 2], T[0, 2]) + math.pi
-    if not (-math.pi/2 <= alpha <= math.pi/2):
-        alpha = math.atan2(T[1, 2], T[0, 2]) - math.pi
+    """
+    Calculate Euler angles (ZYZ) from transformation matrix with improved handling
+    to prevent jumps and singularities.
+    """
+    # Extract the rotation matrix part
+    R = T[:3, :3]
     
+    # Calculate beta with proper handling (range [0, pi])
     beta = math.atan2(
-        T[0, 2] * math.cos(alpha) + T[1, 2] * math.sin(alpha),
-        T[2, 2]
+        math.sqrt(R[0, 2]**2 + R[1, 2]**2),
+        R[2, 2]
     )
     
-    gamma = math.atan2(
-        -T[0, 0] * math.sin(alpha) + T[1, 0] * math.cos(alpha),
-        -T[0, 1] * math.sin(alpha) + T[1, 1] * math.cos(alpha)
-    )
+    # Handle special cases to avoid gimbal lock issues
+    if math.isclose(beta, 0, abs_tol=1e-10) or math.isclose(beta, math.pi, abs_tol=1e-10):
+        # Gimbal lock case - alpha and gamma are coupled
+        # Set alpha to 0 and calculate appropriate gamma
+        alpha = 0
+        if math.isclose(beta, 0, abs_tol=1e-10):
+            gamma = math.atan2(R[1, 0], R[0, 0])
+        else:  # beta ≈ pi
+            gamma = -math.atan2(R[1, 0], R[0, 0])
+    else:
+        # Normal case - calculate alpha and gamma based on beta
+        alpha = math.atan2(R[1, 2]/math.sin(beta), R[0, 2]/math.sin(beta))
+        gamma = math.atan2(R[2, 1]/math.sin(beta), -R[2, 0]/math.sin(beta))
+    
+    # Ensure all angles are in [-pi, pi] range
+    alpha = ((alpha + math.pi) % (2 * math.pi)) - math.pi
+    beta = ((beta + math.pi) % (2 * math.pi)) - math.pi
+    gamma = ((gamma + math.pi) % (2 * math.pi)) - math.pi
     
     return alpha, beta, gamma
 
@@ -174,24 +219,57 @@ def basic_jacobian(thetas):
 def inverse_kinematics(thetas_init, target_pose, max_iterations=500, step_size=0.01):
     """
     Perform inverse kinematics to find joint angles for a target pose.
-    target_pose: [x, y, z, alpha, beta, gamma]
-    Returns: array of joint angles
+    Enhanced to prevent Euler angle jumps during convergence.
+    
+    Args:
+        thetas_init: Initial joint angles
+        target_pose: [x, y, z, alpha, beta, gamma]
+        max_iterations: Maximum iterations for convergence
+        step_size: Step size for joint angle updates
+    
+    Returns: 
+        Array of joint angles
     """
     thetas = thetas_init.copy()
+    
+    # Ensure target Euler angles are normalized
+    target_pose_norm = target_pose.copy()
+    target_pose_norm[3:] = unwrap_angles(target_pose[3:])
+    
+    # Previous pose for tracking orientation changes
+    prev_pose = None
     
     for iteration in range(max_iterations):
         # Get current pose
         current_pose = forward_kinematics(thetas)
         
+        # On first iteration, use current pose as reference
+        if prev_pose is None:
+            prev_pose = current_pose.copy()
+        
+        # Unwrap current Euler angles relative to previous pose to ensure consistency
+        current_pose_unwrapped = current_pose.copy()
+        current_pose_unwrapped[3:] = unwrap_angles(current_pose[3:], prev_pose[3:])
+        prev_pose = current_pose_unwrapped.copy()
+        
         # Calculate pose error
-        pose_error = target_pose - current_pose
+        pose_error = target_pose_norm - current_pose_unwrapped
         
-        # Get current Euler angles
-        alpha, beta, gamma = current_pose[3:]
+        # For orientation error, ensure shortest path
+        pose_error[3:] = unwrap_angles(pose_error[3:])
         
+        # Get Euler angles from the unwrapped current pose
+        alpha, beta, gamma = current_pose_unwrapped[3:]
+        
+        # Compute K_zyz matrix which maps angular velocities to Euler angle rates
+        # Avoid singularities by adding small epsilon to sin(beta)
+        sin_beta = math.sin(beta)
+        if abs(sin_beta) < 1e-6:
+            sin_beta = 1e-6 if sin_beta >= 0 else -1e-6
+            
         K_zyz = np.array([
-            [0, -math.sin(alpha), math.cos(alpha) * math.sin(beta)],
-            [0, math.cos(alpha), math.sin(alpha) * math.sin(beta)],
+            [0, -math.sin(alpha), math.cos(alpha) * sin_beta],
+            [0, math.cos(alpha), math.sin(alpha) * sin_beta],
             [1, 0, math.cos(beta)]
         ])
         
@@ -206,11 +284,14 @@ def inverse_kinematics(thetas_init, target_pose, max_iterations=500, step_size=0
         # Calculate joint velocity
         theta_dot = np.dot(np.dot(J_pinv, K_alpha), pose_error)
         
+        # Adaptive step size to improve convergence
+        adaptive_step = step_size / (1 + 0.3 * np.linalg.norm(pose_error))
+        
         # Update joint angles
-        thetas += step_size * theta_dot
+        thetas += adaptive_step * theta_dot
         
         # Normalize angles to [-pi, pi]
-        thetas = np.array([((angle + math.pi) % (2 * math.pi)) - math.pi for angle in thetas])
+        thetas = unwrap_angles(thetas)
         
         # Check for convergence
         if np.linalg.norm(pose_error) < 1e-5:
@@ -219,7 +300,7 @@ def inverse_kinematics(thetas_init, target_pose, max_iterations=500, step_size=0
     return thetas
 
 ###############################################################################
-# 2) Helper Functions - 元の実装を保持
+# 2) Helper Functions - Modified for better Euler angle handling
 ###############################################################################
 def interpolate_linear(start_pos, end_pos, n_steps=20):
     alphas = np.linspace(0.0, 1.0, n_steps)
@@ -227,29 +308,56 @@ def interpolate_linear(start_pos, end_pos, n_steps=20):
 
 def interpolate_pose(start_pose, end_pose, n_steps=20):
     """
-    Interpolate between start and end poses linearly.
-    Both position and orientation (Euler angles) are interpolated.
+    Interpolate between start and end poses with improved Euler angle handling.
+    Uses angle unwrapping to prevent discontinuities during interpolation.
+    
+    Args:
+        start_pose: Starting pose [x, y, z, alpha, beta, gamma]
+        end_pose: Target pose [x, y, z, alpha, beta, gamma]
+        n_steps: Number of interpolation steps
+        
+    Returns:
+        List of interpolated poses
     """
+    # Extract positions and orientations
+    start_pos, start_orient = start_pose[:3], start_pose[3:]
+    end_pos, end_orient = end_pose[:3], end_pose[3:]
+    
+    # Linear interpolation for positions
     alphas = np.linspace(0.0, 1.0, n_steps)
-    return [(1 - a)*start_pose + a*end_pose for a in alphas]
+    interp_pos = [(1 - a) * start_pos + a * end_pos for a in alphas]
+    
+    # Unwrap end orientation to be consistent with start orientation
+    # This ensures the shortest path when interpolating between angles
+    unwrapped_end = unwrap_angles(end_orient, start_orient)
+    
+    # Interpolate angles with unwrapped values to prevent jumps
+    interp_orient = []
+    for a in alphas:
+        # Linear interpolation between start and unwrapped end orientation
+        orient = (1 - a) * start_orient + a * unwrapped_end
+        interp_orient.append(orient)
+    
+    # Combine interpolated positions and orientations
+    return [np.concatenate([pos, orient]) for pos, orient in zip(interp_pos, interp_orient)]
 
 def set_joint_angles(data, thetas):
     for i in range(len(thetas)):
         data.qpos[i] = thetas[i]
 
 ###############################################################################
-# 3) ターゲット可視化のための新しい関数
+# 3) Target Visualization Functions
 ###############################################################################
 def euler_to_rotation_matrix(alpha, beta, gamma):
     """
-    ZYZオイラー角から回転行列を計算する
+    Calculate rotation matrix from ZYZ Euler angles
     """
-    # 各角度の正弦と余弦を計算
+    # Calculate sine and cosine for each angle
     ca, sa = np.cos(alpha), np.sin(alpha)
     cb, sb = np.cos(beta), np.sin(beta)
     cg, sg = np.cos(gamma), np.sin(gamma)
     
-    # ZYZ回転行列を計算
+    # Calculate ZYZ rotation matrix
     R = np.array([
         [ca*cb*cg - sa*sg, -ca*cb*sg - sa*cg, ca*sb],
         [sa*cb*cg + ca*sg, -sa*cb*sg + ca*cg, sa*sb],
@@ -260,34 +368,34 @@ def euler_to_rotation_matrix(alpha, beta, gamma):
 
 def axis_to_quat(vec1, vec2):
     """
-    2つの単位ベクトル間の回転を表す四元数を計算
-    vec1から見てvec2がどの回転で到達するか
+    Calculate quaternion representing rotation between two unit vectors
+    Shows rotation from vec1 to vec2
     """
-    # 正規化
+    # Normalize vectors
     vec1 = vec1 / np.linalg.norm(vec1)
     vec2 = vec2 / np.linalg.norm(vec2)
     
-    # 内積とクロス積を計算
+    # Calculate dot product and cross product
     dot_product = np.dot(vec1, vec2)
     cross_product = np.cross(vec1, vec2)
     
-    # 特殊ケース: ベクトルが並行（同じ方向または逆方向）
+    # Special case: vectors are parallel (same or opposite direction)
     if np.isclose(dot_product, 1.0):
-        return "1 0 0 0"  # 単位四元数（回転なし）
+        return "1 0 0 0"  # Identity quaternion (no rotation)
     elif np.isclose(dot_product, -1.0):
-        # 180度回転 - 任意の垂直軸を選択
+        # 180-degree rotation - choose any perpendicular axis
         perp = np.array([1, 0, 0]) if not np.allclose(vec1, [1, 0, 0]) else np.array([0, 1, 0])
         perp = perp - vec1 * np.dot(perp, vec1)
         perp = perp / np.linalg.norm(perp)
         return f"0 {perp[0]} {perp[1]} {perp[2]}"
         
-    # 回転角度を計算
+    # Calculate rotation angle
     angle = np.arccos(np.clip(dot_product, -1.0, 1.0))
     
-    # 回転軸を計算（正規化されたクロス積）
+    # Calculate rotation axis (normalized cross product)
     axis = cross_product / np.linalg.norm(cross_product)
     
-    # 四元数を計算
+    # Calculate quaternion components
     w = np.cos(angle / 2)
     xyz = axis * np.sin(angle / 2)
     
@@ -295,37 +403,37 @@ def axis_to_quat(vec1, vec2):
 
 def remove_existing_target(model_xml):
     """
-    既存のターゲットサイトの定義を削除
+    Remove existing target site definitions from the model XML
     """
-    # ターゲットサイトを見つける正規表現パターン
+    # Regex pattern to find target sites
     site_pattern = r'<site\s+name="target[^"]*"[^>]*>'
     
-    # 既存のターゲットサイトを削除
+    # Remove existing target sites
     model_xml = re.sub(site_pattern, '<!-- Removed target site -->', model_xml)
     return model_xml
 
 def add_target_visualization(model_xml, target_pos, target_orientation):
     """
-    ターゲット位置と姿勢を可視化するための要素をモデルXMLに追加
+    Add elements to visualize target position and orientation to the model XML
     """
-    # 既存のターゲットサイトを削除
+    # Remove any existing target sites
     model_xml = remove_existing_target(model_xml)
     
-    # </worldbody>タグを見つける
+    # Find the </worldbody> tag
     worldbody_end = model_xml.find("</worldbody>")
     if worldbody_end == -1:
         print("Warning: Could not find </worldbody> tag in the XML.")
         return model_xml
     
-    # オイラー角から回転行列を計算
+    # Calculate rotation matrix from Euler angles
     R = euler_to_rotation_matrix(*target_orientation)
     
-    # ターゲット位置の球体とXYZ軸マーカーを追加
+    # Add target position sphere and XYZ axis markers
     target_sites = f"""
-    <!-- ターゲット位置マーカー（赤色の球） -->
+    <!-- Target position marker (red sphere) -->
     <site name="target_pos" pos="{target_pos[0]} {target_pos[1]} {target_pos[2]}" size="0.01 0.01 0.01" type="sphere" rgba="1 0 0 0.7"/>
     
-    <!-- ターゲット姿勢マーカー（RGB = XYZ軸） -->
+    <!-- Target orientation markers (RGB = XYZ axes) -->
     <site name="target_x_axis" pos="{target_pos[0]} {target_pos[1]} {target_pos[2]}" 
           size="0.001 0.03 0.001" type="cylinder" rgba="1 0 0 1" 
           quat="{axis_to_quat(np.array([0, 0, 1]), R[:, 0])}"/>
@@ -338,124 +446,124 @@ def add_target_visualization(model_xml, target_pos, target_orientation):
           size="0.001 0.03 0.001" type="cylinder" rgba="0 0 1 1" 
           quat="{axis_to_quat(np.array([0, 0, 1]), R[:, 2])}"/>
     
-    <!-- ターゲット位置と現在位置の間の線 -->
+    <!-- Line connecting target position and current position -->
     <site name="target_line" pos="0 0 0" size="0.001 0.001 0.001" type="cylinder" rgba="1 1 0 0.5"/>
     """
     
-    # worldbodyの閉じタグの前に挿入
+    # Insert before the closing worldbody tag
     xml_with_target = model_xml[:worldbody_end] + target_sites + model_xml[worldbody_end:]
     return xml_with_target
 
 def update_target_line(model, data, ee_pos, target_pos):
     """
-    エンドエフェクタからターゲットまでの線を更新
+    Update the line connecting end effector to target
     """
-    # サイトIDを取得
+    # Get site ID
     line_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "target_line")
     if line_id == -1:
-        return  # サイトが見つからない場合は何もしない
+        return  # Site not found, do nothing
     
-    # 線の中間点と方向を計算
+    # Calculate midpoint and direction
     midpoint = (ee_pos + target_pos) / 2
     direction = target_pos - ee_pos
     length = np.linalg.norm(direction)
     
     if length < 1e-6:
-        return  # 距離が非常に小さい場合は更新しない
+        return  # Distance too small, don't update
     
-    # 線の位置を設定
+    # Set line position
     model.site_pos[line_id] = midpoint
     
-    # 線のサイズを設定 - MuJoCo APIでは3つの値が必要
+    # Set line size - MuJoCo API needs three values
     model.site_size[line_id] = np.array([0.001, length/2, 0.001])
     
-    # 線の方向を設定（単位ベクトルに変換）
+    # Set line direction (convert to unit vector)
     direction = direction / length
     
-    # Z軸方向から目標方向への回転を計算
+    # Calculate rotation from Z-axis to target direction
     quat_str = axis_to_quat(np.array([0, 0, 1]), direction)
     quat_vals = np.array([float(x) for x in quat_str.split()])
     model.site_quat[line_id] = quat_vals
 
 ###############################################################################
-# 4) メインのデモ関数
+# 4) Main Demo Function
 ###############################################################################
 def run_robot_demo(target_pos, target_orientation, output_file="robot_pose_trajectory.mp4"):
     """
-    ターゲット位置と姿勢を可視化したロボットアームのデモを実行
+    Run robot arm demo visualizing target position and orientation
     """
-    # 一時ファイルの削除
+    # Remove temporary files
     if os.path.exists("temp_model_with_target.xml"):
         try:
             os.remove("temp_model_with_target.xml")
-            print("前回の一時ファイルを削除しました")
+            print("Removed previous temporary file")
         except Exception as e:
-            print(f"一時ファイルの削除中にエラーが発生: {e}")
+            print(f"Error removing temporary file: {e}")
     
-    # XMLファイルのパスを見つける
+    # Find XML file path
     try:
         script_dir = Path(__file__).resolve().parent
         model_path = script_dir / "config" / "xml" / "mycobot_280jn_mujoco.xml"
         if not model_path.exists():
-            print(f"XMLファイルが見つかりません: {model_path}")
+            print(f"XML file not found: {model_path}")
             
-            # カレントディレクトリからも探す
+            # Also search in current directory
             model_path = Path("config/xml/mycobot_280jn_mujoco_demo.xml")
             if not model_path.exists():
-                print(f"XMLファイルが見つかりません: {model_path}")
-                raise FileNotFoundError("モデルXMLファイルが見つかりません")
+                print(f"XML file not found: {model_path}")
+                raise FileNotFoundError("Model XML file not found")
         
         model_path = str(model_path)
     except Exception as e:
-        print(f"モデルパスの検索中にエラーが発生: {e}")
+        print(f"Error searching for model path: {e}")
         return False
     
-    # ロボットモデルの読み込み
+    # Load robot model
     try:
-        # XMLを文字列として読み込む
+        # Load XML as string
         with open(model_path, 'r') as f:
             model_xml = f.read()
         
-        # メッシュディレクトリのパスを修正
+        # Fix mesh directory path
         script_dir = Path(__file__).resolve().parent
         mesh_dir = script_dir / "config" / "meshes_mujoco"
         
         if not mesh_dir.exists():
-            print(f"メッシュディレクトリが見つかりません: {mesh_dir}")
-            # カレントディレクトリからも探す
+            print(f"Mesh directory not found: {mesh_dir}")
+            # Search in current directory
             mesh_dir = Path("config/meshes_mujoco")
             if not mesh_dir.exists():
-                print(f"メッシュディレクトリが見つかりません: {mesh_dir}")
-                raise FileNotFoundError("メッシュディレクトリが見つかりません")
+                print(f"Mesh directory not found: {mesh_dir}")
+                raise FileNotFoundError("Mesh directory not found")
         
-        # 絶対パスに変換
+        # Convert to absolute path
         mesh_dir = str(mesh_dir.absolute())
         
-        # meshdir属性を正しいパスに置換
+        # Replace meshdir attribute with correct path
         if 'meshdir=' in model_xml:
-            start_idx = model_xml.find('meshdir=') + 9  # 'meshdir="'の長さは9
+            start_idx = model_xml.find('meshdir=') + 9  # Length of 'meshdir="' is 9
             end_idx = model_xml.find('"', start_idx)
             old_meshdir = model_xml[start_idx:end_idx]
             
-            # 新しいパスに置換
+            # Replace with new path
             model_xml = model_xml.replace(f'meshdir="{old_meshdir}"', f'meshdir="{mesh_dir}"')
         
-        # ターゲット可視化要素を追加
+        # Add target visualization elements
         model_xml = add_target_visualization(model_xml, target_pos, target_orientation)
         
-        # 一時ファイルに保存
+        # Save to temporary file
         temp_model_path = "temp_model_with_target.xml"
         with open(temp_model_path, 'w') as f:
             f.write(model_xml)
         
-        # 修正したモデルを読み込む
+        # Load modified model
         model = mujoco.MjModel.from_xml_path(temp_model_path)
         data = mujoco.MjData(model)
     except Exception as e:
-        print(f"モデルの設定中にエラーが発生: {e}")
+        print(f"Error configuring model: {e}")
         return False
     
-    # レンダラーの設定
+    # Configure renderer
     try:
         render_width, render_height = 1920, 1088
         model.vis.global_.offwidth = render_width
@@ -464,84 +572,84 @@ def run_robot_demo(target_pos, target_orientation, output_file="robot_pose_traje
         renderer = mujoco.Renderer(model, render_height, render_width)
         renderer.enable_shadows = True
     except Exception as e:
-        print(f"レンダラーの設定中にエラーが発生: {e}")
+        print(f"Error configuring renderer: {e}")
         return False
     
-    # 初期条件の設定
+    # Set initial conditions
     ee_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "joint6_flange")
     
     thetas_init = np.zeros(6, dtype=float)
     set_joint_angles(data, thetas_init)
     mujoco.mj_forward(model, data)
     
-    # 初期姿勢を取得し、ターゲット姿勢を設定
+    # Get initial pose and set target pose
     initial_pose = forward_kinematics(thetas_init)
     target_pose = np.concatenate([target_pos, target_orientation])
     
-    # スムーズな動きのためにウェイポイントを生成
+    # Generate waypoints for smooth movement
     n_steps = 100
     waypoints = interpolate_pose(initial_pose, target_pose, n_steps)
     
-    # フレームとログの初期化
+    # Initialize frames and logs
     frames = []
     current_thetas = thetas_init.copy()
     
-    # ログデータの初期化
+    # Initialize log data
     joint_angle_log = []
     ee_pos_log = []
     ee_orient_log = []
     
-    print("\n目標位置と姿勢へロボットを移動しています (Moving robot to target position and orientation)")
-    print(f"目標位置 (Target position): {target_pos}")
-    print(f"目標姿勢 (Target orientation in ZYZ Euler angles): {target_orientation}")
+    print("\nMoving robot to target position and orientation")
+    print(f"Target position: {target_pos}")
+    print(f"Target orientation (ZYZ Euler angles): {target_orientation}")
     
     for i, wp in enumerate(waypoints):
-        # 逆運動学で関節角度を計算
+        # Calculate joint angles using inverse kinematics
         current_thetas = inverse_kinematics(current_thetas, wp)
         
-        # シミュレーションに関節角度を設定
+        # Set joint angles in simulation
         set_joint_angles(data, current_thetas)
         mujoco.mj_forward(model, data)
         
-        # 現在のエンドエフェクタの位置と姿勢を取得
+        # Get current end effector position and orientation
         mujoco_ee_pos = data.xpos[ee_body_id]
         our_ee_pose = forward_kinematics(current_thetas)
         our_ee_pos = our_ee_pose[:3]
         our_ee_orient = our_ee_pose[3:]
         
-        # ターゲット線を更新
+        # Update target line
         update_target_line(model, data, mujoco_ee_pos, target_pos)
         
-        # 誤差を計算
+        # Calculate errors
         pos_diff = np.linalg.norm(mujoco_ee_pos - our_ee_pos)
         pos_err_to_target = np.linalg.norm(target_pos - our_ee_pos)
-        orient_err_to_target = np.linalg.norm(target_orientation - our_ee_orient)
+        orient_err_to_target = np.linalg.norm(unwrap_angles(target_orientation, our_ee_orient) - our_ee_orient)
         
-        # ログを記録
+        # Record logs
         joint_angle_log.append(current_thetas.copy())
         ee_pos_log.append(our_ee_pos.copy())
         ee_orient_log.append(our_ee_orient.copy())
         
-        # 進捗を表示
-        print(f"ステップ {i+1}/{n_steps} | "
-              f"位置誤差: {pos_err_to_target:.5f}, "
-              f"姿勢誤差: {orient_err_to_target:.5f}, "
-              f"MuJoCo-FK差分: {pos_diff:.5f}")
+        # Display progress
+        print(f"Step {i+1}/{n_steps} | "
+              f"Position error: {pos_err_to_target:.5f}, "
+              f"Orientation error: {orient_err_to_target:.5f}, "
+              f"MuJoCo-FK difference: {pos_diff:.5f}")
         
-        # レンダリングとフレーム保存
+        # Render and save frame
         renderer.update_scene(data)
         frames.append(renderer.render())
     
-    # 動画の保存
+    # Save video
     try:
-        print(f"ビデオを保存しています: {output_file}")
+        print(f"Saving video: {output_file}")
         imageio.mimsave(output_file, frames, fps=30, quality=8, bitrate="16M")
-        print(f"ビデオが保存されました: {output_file}")
+        print(f"Video saved: {output_file}")
     except Exception as e:
-        print(f"ビデオの保存中にエラーが発生: {e}")
+        print(f"Error saving video: {e}")
         return False
     
-    # ログデータの保存
+    # Save log data
     log_file = os.path.splitext(output_file)[0] + "_log.npz"
     try:
         np.savez(log_file, 
@@ -550,11 +658,11 @@ def run_robot_demo(target_pos, target_orientation, output_file="robot_pose_traje
                  joint_angles=np.array(joint_angle_log),
                  ee_positions=np.array(ee_pos_log),
                  ee_orientations=np.array(ee_orient_log))
-        print(f"ログが保存されました: {log_file}")
+        print(f"Log saved: {log_file}")
     except Exception as e:
-        print(f"ログの保存中にエラーが発生: {e}")
+        print(f"Error saving log: {e}")
     
-    # クリーンアップ
+    # Cleanup
     renderer.close()
     if os.path.exists("temp_model_with_target.xml"):
         os.remove("temp_model_with_target.xml")
@@ -562,29 +670,29 @@ def run_robot_demo(target_pos, target_orientation, output_file="robot_pose_traje
     return True
 
 ###############################################################################
-# 5) インタラクティブモード
+# 5) Interactive Mode
 ###############################################################################
 def run_interactive_mode(initial_target_pos, initial_target_orientation):
     """
-    MuJoCoのビューアを使ってインタラクティブモードで実行
+    Run in interactive mode using MuJoCo viewer
     """
-    print("インタラクティブモードを開始します")
+    print("Starting interactive mode")
     
     try:
         from mujoco import viewer
     except ImportError:
-        print("インタラクティブモードにはmujoco.viewerが必要です")
-        print("最新のMuJoCoパッケージがインストールされていることを確認してください")
+        print("Interactive mode requires mujoco.viewer")
+        print("Make sure the latest MuJoCo package is installed")
         return False
     
-    # 一時ファイルを削除
+    # Remove temporary files
     if os.path.exists("temp_model_with_target.xml"):
         try:
             os.remove("temp_model_with_target.xml")
         except Exception:
             pass
     
-    # XMLファイルのパスを見つける
+    # Find XML file path
     try:
         script_dir = Path(__file__).resolve().parent
         model_path = script_dir / "config" / "xml" / "mycobot_280jn_mujoco.xml"
@@ -592,15 +700,15 @@ def run_interactive_mode(initial_target_pos, initial_target_orientation):
             model_path = Path("config/xml/mycobot_280jn_mujoco_demo.xml")
         model_path = str(model_path)
     except Exception as e:
-        print(f"モデルパスの検索中にエラーが発生: {e}")
+        print(f"Error searching for model path: {e}")
         return False
     
-    # ロボットモデルの読み込み
+    # Load robot model
     try:
         with open(model_path, 'r') as f:
             model_xml = f.read()
         
-        # メッシュディレクトリのパスを修正
+        # Fix mesh directory path
         mesh_dir = Path("config/meshes_mujoco").absolute()
         
         if 'meshdir=' in model_xml:
@@ -609,85 +717,85 @@ def run_interactive_mode(initial_target_pos, initial_target_orientation):
             old_meshdir = model_xml[start_idx:end_idx]
             model_xml = model_xml.replace(f'meshdir="{old_meshdir}"', f'meshdir="{mesh_dir}"')
         
-        # ターゲット可視化要素を追加
+        # Add target visualization elements
         model_xml = add_target_visualization(model_xml, initial_target_pos, initial_target_orientation)
         
-        # 一時ファイルに保存
+        # Save to temporary file
         temp_model_path = "temp_model_with_target.xml"
         with open(temp_model_path, 'w') as f:
             f.write(model_xml)
         
-        # 修正したモデルを読み込む
+        # Load modified model
         model = mujoco.MjModel.from_xml_path(temp_model_path)
         data = mujoco.MjData(model)
     except Exception as e:
-        print(f"モデルの設定中にエラーが発生: {e}")
+        print(f"Error configuring model: {e}")
         return False
     
-    # 初期条件の設定
+    # Set initial conditions
     thetas_init = np.zeros(6, dtype=float)
     set_joint_angles(data, thetas_init)
     mujoco.mj_forward(model, data)
     
-    # 初期ターゲットに移動
+    # Move to initial target
     target_pose = np.concatenate([initial_target_pos, initial_target_orientation])
     current_thetas = inverse_kinematics(thetas_init, target_pose)
     set_joint_angles(data, current_thetas)
     mujoco.mj_forward(model, data)
     
-    # ビューアを開始
-    print("\nインタラクティブビューアを起動します")
-    print("操作方法:")
-    print("  マウス左ドラッグ: 視点回転")
-    print("  マウス右ドラッグ: 視点移動")
-    print("  マウスホイール: ズーム")
-    print("  Esc: 終了")
+    # Start viewer
+    print("\nLaunching interactive viewer")
+    print("Controls:")
+    print("  Left mouse drag: Rotate view")
+    print("  Right mouse drag: Move view")
+    print("  Mouse wheel: Zoom")
+    print("  Esc: Exit")
     
     viewer.launch(model, data)
     
     return True
 
 ###############################################################################
-# 6) メイン関数
+# 6) Main Function
 ###############################################################################
 def main():
     """
-    コマンドライン引数を解析してデモを実行するメイン関数
+    Main function to parse command line arguments and run the demo
     """
-    parser = argparse.ArgumentParser(description='ロボットアームデモ - ターゲット位置と姿勢の可視化')
+    parser = argparse.ArgumentParser(description='Robot arm demo - Visualizing target position and orientation')
     
-    # ターゲット位置の引数
-    parser.add_argument('--x', type=float, default=0.1, help='目標位置 X (デフォルト: 0.1)')
-    parser.add_argument('--y', type=float, default=-0.2, help='目標位置 Y (デフォルト: -0.2)')
-    parser.add_argument('--z', type=float, default=0.15, help='目標位置 Z (デフォルト: 0.2)')
+    # Target position arguments
+    parser.add_argument('--x', type=float, default=0.05826, help='Target position X (default: 0.06026)')
+    parser.add_argument('--y', type=float, default=-0.2752, help='Target position Y (default: -0.2752)')
+    parser.add_argument('--z', type=float, default=0.1566 , help='Target position Z (default: 0.0566)')
+    # Target orientation arguments (in radians)
+    parser.add_argument('--alpha', type=float, default=0.0, help='Target orientation Alpha - rotation around Z axis (default: 0.0)')
+    parser.add_argument('--beta', type=float, default=0.0, help='Target orientation Beta - rotation around Y axis (default: 0.0)')
+    parser.add_argument('--gamma', type=float, default=0.0, help='Target orientation Gamma - rotation around Z axis (default: 0.0)')
     
-    # ターゲット姿勢の引数 (ラジアン単位)
-    parser.add_argument('--alpha', type=float, default=0.0, help='目標姿勢 Alpha - X軸周りの回転 (デフォルト: 0.0)')
-    parser.add_argument('--beta', type=float, default=-np.pi/4, help='目標姿勢 Beta - Y軸周りの回転 (デフォルト: 0.0)')
-    parser.add_argument('--gamma', type=float, default=0.0, help='目標姿勢 Gamma - Z軸周りの回転 (デフォルト: 0.0)')
+    # Output file
+    parser.add_argument('--output', type=str, default="robot_pose_trajectory.mp4", help='Output video file (default: robot_pose_trajectory.mp4)')
     
-    # 出力ファイル
-    parser.add_argument('--output', type=str, default="robot_pose_trajectory.mp4", help='出力ビデオファイル (デフォルト: robot_pose_trajectory.mp4)')
-    
-    # インタラクティブモードフラグ
-    parser.add_argument('--interactive', action='store_true', help='インタラクティブモードで実行 (デフォルト: False)')
+    # Interactive mode flag
+    parser.add_argument('--interactive', action='store_true', help='Run in interactive mode (default: False)')
     
     args = parser.parse_args()
     
-    # ターゲット位置と姿勢の配列を作成
+    # Create target position and orientation arrays
     target_pos = np.array([args.x, args.y, args.z])
     target_orientation = np.array([args.alpha, args.beta, args.gamma])
     
-    # 適切なモードで実行
+    # Run in appropriate mode
     if args.interactive:
         success = run_interactive_mode(target_pos, target_orientation)
     else:
         success = run_robot_demo(target_pos, target_orientation, args.output)
     
     if success:
-        print("デモが正常に完了しました")
+        print("Demo completed successfully")
     else:
-        print("デモの実行中にエラーが発生しました")
+        print("Error occurred during demo execution")
 
 if __name__ == "__main__":
     main()
+

@@ -86,23 +86,68 @@ def forward_kinematics(thetas):
     
     return np.array([x, y, z, alpha, beta, gamma])
 
+def unwrap_angles(angles, reference=None):
+    """
+    Unwrap angles to ensure continuous motion without jumps.
+    When reference is provided, unwraps angles to be nearest to reference values.
+    
+    Args:
+        angles: Array of angles to unwrap
+        reference: Optional reference angles for consistent unwrapping
+    
+    Returns:
+        Unwrapped angles with minimized discontinuities
+    """
+    unwrapped = np.array(angles)
+    
+    if reference is not None:
+        # Unwrap relative to reference angles
+        for i in range(len(unwrapped)):
+            # Calculate difference and ensure it's in [-pi, pi]
+            diff = unwrapped[i] - reference[i]
+            diff = ((diff + math.pi) % (2 * math.pi)) - math.pi
+            
+            # Apply the adjusted difference
+            unwrapped[i] = reference[i] + diff
+    else:
+        # Ensure all angles are in [-pi, pi] range
+        for i in range(len(unwrapped)):
+            unwrapped[i] = ((unwrapped[i] + math.pi) % (2 * math.pi)) - math.pi
+            
+    return unwrapped
+
 def euler_angle_from_matrix(T):
-    """Calculate Euler angles (ZYZ) from transformation matrix."""
-    alpha = math.atan2(T[1, 2], T[0, 2])
-    if not (-math.pi/2 <= alpha <= math.pi/2):
-        alpha = math.atan2(T[1, 2], T[0, 2]) + math.pi
-    if not (-math.pi/2 <= alpha <= math.pi/2):
-        alpha = math.atan2(T[1, 2], T[0, 2]) - math.pi
+    """
+    Calculate Euler angles (ZYZ) from transformation matrix with improved handling
+    to prevent jumps and singularities.
+    """
+    # Extract the rotation matrix part
+    R = T[:3, :3]
     
+    # Calculate beta with proper handling (range [0, pi])
     beta = math.atan2(
-        T[0, 2] * math.cos(alpha) + T[1, 2] * math.sin(alpha),
-        T[2, 2]
+        math.sqrt(R[0, 2]**2 + R[1, 2]**2),
+        R[2, 2]
     )
     
-    gamma = math.atan2(
-        -T[0, 0] * math.sin(alpha) + T[1, 0] * math.cos(alpha),
-        -T[0, 1] * math.sin(alpha) + T[1, 1] * math.cos(alpha)
-    )
+    # Handle special cases to avoid gimbal lock issues
+    if math.isclose(beta, 0, abs_tol=1e-10) or math.isclose(beta, math.pi, abs_tol=1e-10):
+        # Gimbal lock case - alpha and gamma are coupled
+        # Set alpha to 0 and calculate appropriate gamma
+        alpha = 0
+        if math.isclose(beta, 0, abs_tol=1e-10):
+            gamma = math.atan2(R[1, 0], R[0, 0])
+        else:  # beta ≈ pi
+            gamma = -math.atan2(R[1, 0], R[0, 0])
+    else:
+        # Normal case - calculate alpha and gamma based on beta
+        alpha = math.atan2(R[1, 2]/math.sin(beta), R[0, 2]/math.sin(beta))
+        gamma = math.atan2(R[2, 1]/math.sin(beta), -R[2, 0]/math.sin(beta))
+    
+    # Ensure all angles are in [-pi, pi] range
+    alpha = ((alpha + math.pi) % (2 * math.pi)) - math.pi
+    beta = ((beta + math.pi) % (2 * math.pi)) - math.pi
+    gamma = ((gamma + math.pi) % (2 * math.pi)) - math.pi
     
     return alpha, beta, gamma
 
@@ -162,24 +207,57 @@ def basic_jacobian(thetas):
 def inverse_kinematics(thetas_init, target_pose, max_iterations=500, step_size=0.01):
     """
     Perform inverse kinematics to find joint angles for a target pose.
-    target_pose: [x, y, z, alpha, beta, gamma]
-    Returns: array of joint angles
+    Enhanced to prevent Euler angle jumps during convergence.
+    
+    Args:
+        thetas_init: Initial joint angles
+        target_pose: [x, y, z, alpha, beta, gamma]
+        max_iterations: Maximum iterations for convergence
+        step_size: Step size for joint angle updates
+    
+    Returns: 
+        Array of joint angles
     """
     thetas = thetas_init.copy()
+    
+    # Ensure target Euler angles are normalized
+    target_pose_norm = target_pose.copy()
+    target_pose_norm[3:] = unwrap_angles(target_pose[3:])
+    
+    # Previous pose for tracking orientation changes
+    prev_pose = None
     
     for iteration in range(max_iterations):
         # Get current pose
         current_pose = forward_kinematics(thetas)
         
+        # On first iteration, use current pose as reference
+        if prev_pose is None:
+            prev_pose = current_pose.copy()
+        
+        # Unwrap current Euler angles relative to previous pose to ensure consistency
+        current_pose_unwrapped = current_pose.copy()
+        current_pose_unwrapped[3:] = unwrap_angles(current_pose[3:], prev_pose[3:])
+        prev_pose = current_pose_unwrapped.copy()
+        
         # Calculate pose error
-        pose_error = target_pose - current_pose
+        pose_error = target_pose_norm - current_pose_unwrapped
         
-        # Get current Euler angles
-        alpha, beta, gamma = current_pose[3:]
+        # For orientation error, ensure shortest path
+        pose_error[3:] = unwrap_angles(pose_error[3:])
         
+        # Get Euler angles from the unwrapped current pose
+        alpha, beta, gamma = current_pose_unwrapped[3:]
+        
+        # Compute K_zyz matrix which maps angular velocities to Euler angle rates
+        # Avoid singularities by adding small epsilon to sin(beta)
+        sin_beta = math.sin(beta)
+        if abs(sin_beta) < 1e-6:
+            sin_beta = 1e-6 if sin_beta >= 0 else -1e-6
+            
         K_zyz = np.array([
-            [0, -math.sin(alpha), math.cos(alpha) * math.sin(beta)],
-            [0, math.cos(alpha), math.sin(alpha) * math.sin(beta)],
+            [0, -math.sin(alpha), math.cos(alpha) * sin_beta],
+            [0, math.cos(alpha), math.sin(alpha) * sin_beta],
             [1, 0, math.cos(beta)]
         ])
         
@@ -194,11 +272,14 @@ def inverse_kinematics(thetas_init, target_pose, max_iterations=500, step_size=0
         # Calculate joint velocity
         theta_dot = np.dot(np.dot(J_pinv, K_alpha), pose_error)
         
+        # Adaptive step size to improve convergence
+        adaptive_step = step_size / (1 + 0.1 * np.linalg.norm(pose_error))
+        
         # Update joint angles
-        thetas += step_size * theta_dot
+        thetas += adaptive_step * theta_dot
         
         # Normalize angles to [-pi, pi]
-        thetas = np.array([((angle + math.pi) % (2 * math.pi)) - math.pi for angle in thetas])
+        thetas = unwrap_angles(thetas)
         
         # Check for convergence
         if np.linalg.norm(pose_error) < 1e-5:
@@ -215,11 +296,38 @@ def interpolate_linear(start_pos, end_pos, n_steps=20):
 
 def interpolate_pose(start_pose, end_pose, n_steps=20):
     """
-    Interpolate between start and end poses linearly.
-    Both position and orientation (Euler angles) are interpolated.
+    Interpolate between start and end poses with improved Euler angle handling.
+    Uses angle unwrapping to prevent discontinuities during interpolation.
+    
+    Args:
+        start_pose: Starting pose [x, y, z, alpha, beta, gamma]
+        end_pose: Target pose [x, y, z, alpha, beta, gamma]
+        n_steps: Number of interpolation steps
+        
+    Returns:
+        List of interpolated poses
     """
+    # Extract positions and orientations
+    start_pos, start_orient = start_pose[:3], start_pose[3:]
+    end_pos, end_orient = end_pose[:3], end_pose[3:]
+    
+    # Linear interpolation for positions
     alphas = np.linspace(0.0, 1.0, n_steps)
-    return [(1 - a)*start_pose + a*end_pose for a in alphas]
+    interp_pos = [(1 - a) * start_pos + a * end_pos for a in alphas]
+    
+    # Unwrap end orientation to be consistent with start orientation
+    # This ensures the shortest path when interpolating between angles
+    unwrapped_end = unwrap_angles(end_orient, start_orient)
+    
+    # Interpolate angles with unwrapped values to prevent jumps
+    interp_orient = []
+    for a in alphas:
+        # Linear interpolation between start and unwrapped end orientation
+        orient = (1 - a) * start_orient + a * unwrapped_end
+        interp_orient.append(orient)
+    
+    # Combine interpolated positions and orientations
+    return [np.concatenate([pos, orient]) for pos, orient in zip(interp_pos, interp_orient)]
 
 def set_joint_angles(data, thetas):
     for i in range(len(thetas)):
@@ -274,6 +382,12 @@ def main():
     ee_orient_log = []
 
     print("\nStarting motion along a trajectory with changing position and orientation.")
+    
+    # Create additional arrays to track Euler angles for analysis
+    alpha_values = []
+    beta_values = []
+    gamma_values = []
+    
     for i, wp in enumerate(waypoints):
         current_thetas = inverse_kinematics(current_thetas, wp)
         set_joint_angles(data, current_thetas)
@@ -283,6 +397,11 @@ def main():
         our_ee_pose = forward_kinematics(current_thetas)
         our_ee_pos = our_ee_pose[:3]
         our_ee_orient = our_ee_pose[3:]
+        
+        # Track Euler angles for analysis
+        alpha_values.append(our_ee_orient[0])
+        beta_values.append(our_ee_orient[1])
+        gamma_values.append(our_ee_orient[2])
         
         pos_diff = np.linalg.norm(mujoco_ee_pos - our_ee_pos)
 
@@ -296,7 +415,10 @@ def main():
 
         # Calculate errors to target
         pos_err_to_final = np.linalg.norm(target_pose[:3] - our_ee_pos)
-        orient_err_to_final = np.linalg.norm(target_pose[3:] - our_ee_orient)
+        
+        # Use unwrapped angles for calculating orientation error
+        target_orient_unwrapped = unwrap_angles(target_pose[3:], our_ee_orient)
+        orient_err_to_final = np.linalg.norm(target_orient_unwrapped - our_ee_orient)
         
         print(f"Step {i+1}/{n_steps} | "
               f"Pos err: {pos_err_to_final:.5f}, "
@@ -311,7 +433,10 @@ def main():
     np.savez("robot_pose_logs.npz",
              joint_angles=np.array(joint_angle_log),
              ee_positions=np.array(ee_pos_log),
-             ee_orientations=np.array(ee_orient_log))
+             ee_orientations=np.array(ee_orient_log),
+             alpha_values=np.array(alpha_values),
+             beta_values=np.array(beta_values),
+             gamma_values=np.array(gamma_values))
     print("Logs saved to 'robot_pose_logs.npz'.")
 
     renderer.close()
