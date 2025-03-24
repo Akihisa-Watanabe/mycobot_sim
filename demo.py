@@ -1,714 +1,445 @@
+#!/usr/bin/env python3
+"""
+Robot arm demo visualizing target position and orientation using diff_ik algorithm
+Moves the robot arm to user-specified position and orientation, visualizing the process.
+Uses quaternion as internal representation with Euler angle input from user.
+"""
+
 import mujoco
-import mujoco.viewer
 import numpy as np
 import math
+import imageio
+import argparse
 import time
 import os
+import re
+from pathlib import Path
+
+# Import functionality from diff_ik.py
+from mycobot_sim.inverse_kinematics_full import (
+    dh_transform, 
+    euler_to_quaternion, 
+    quaternion_to_euler, 
+    rotation_matrix_to_quaternion, 
+    quaternion_to_rotation_matrix, 
+    quaternion_multiply, 
+    quaternion_conjugate, 
+    normalize_quaternion, 
+    forward_kinematics, 
+    basic_jacobian, 
+    inverse_kinematics_step, 
+    set_joint_angles,
+    quaternion_error
+)
 
 ###############################################################################
-# 1) Angle Conversions and DH Transformations
+# Target Visualization Functions
 ###############################################################################
-def dh_transform(a, alpha, d, theta):
-    """Compute the Denavit-Hartenberg transformation matrix.
-    
-    Args:
-        a: Link length
-        alpha: Link twist
-        d: Link offset
-        theta: Joint angle
-        
-    Returns:
-        4x4 homogeneous transformation matrix
+def remove_existing_target(model_xml):
     """
-    ct = np.cos(theta)
-    st = np.sin(theta)
-    ca = np.cos(alpha)
-    sa = np.sin(alpha)
-    return np.array([
-        [ct,       -st*ca,     st*sa,      a*ct],
-        [st,        ct*ca,    -ct*sa,      a*st],
-        [0,         sa,        ca,         d   ],
-        [0,         0,         0,          1   ]
-    ], dtype=float)
+    Remove existing target site definitions from the model XML
+    """
+    # Regex pattern to find target sites
+    site_pattern = r'<site\s+name="target[^"]*"[^>]*>'
+    
+    # Remove existing target sites
+    model_xml = re.sub(site_pattern, '<!-- Removed target site -->', model_xml)
+    return model_xml
 
-def euler_to_quaternion(euler):
-    """Convert ZYZ Euler angles to quaternion [w, x, y, z].
+def add_target_visualization(model_xml, target_pos, target_orientation):
+    """
+    Add elements to visualize target position and orientation to the model XML
     
     Args:
-        euler: Euler angles [alpha, beta, gamma] (ZYZ convention)
+        model_xml: Model XML string
+        target_pos: Target position [x, y, z]
+        target_orientation: Target orientation as Euler angles [alpha, beta, gamma]
         
     Returns:
-        Quaternion [w, x, y, z]
+        Modified model XML string
     """
-    alpha, beta, gamma = euler
+    # Remove any existing target sites
+    model_xml = remove_existing_target(model_xml)
     
-    # Half angles
-    ha = alpha / 2.0
-    hb = beta / 2.0
-    hg = gamma / 2.0
+    # Find the </worldbody> tag
+    worldbody_end = model_xml.find("</worldbody>")
+    if worldbody_end == -1:
+        print("Warning: Could not find </worldbody> tag in the XML.")
+        return model_xml
     
-    # Pre-compute sines and cosines
-    ca = np.cos(ha)
-    sa = np.sin(ha)
-    cb = np.cos(hb)
-    sb = np.sin(hb)
-    cg = np.cos(hg)
-    sg = np.sin(hg)
+    # Convert Euler angles to rotation matrix
+    target_quat = euler_to_quaternion(target_orientation)
+    R = quaternion_to_rotation_matrix(target_quat)
     
-    # Compute quaternion components
-    w = ca*cb*cg - sa*cb*sg
-    x = ca*sb*cg + sa*sb*sg
-    y = sa*sb*cg - ca*sb*sg
-    z = ca*cb*sg + sa*cb*cg
+    # Add target position sphere and XYZ axis markers
+    target_sites = f"""
+    <!-- Target position marker (red sphere) -->
+    <site name="target_pos" pos="{target_pos[0]} {target_pos[1]} {target_pos[2]}" size="0.01 0.01 0.01" type="sphere" rgba="1 0 0 0.7"/>
     
-    return normalize_quaternion(np.array([w, x, y, z]))
+    <!-- Target orientation markers (RGB = XYZ axes) -->
+    <site name="target_x_axis" pos="{target_pos[0]} {target_pos[1]} {target_pos[2]}" 
+          size="0.001 0.03 0.001" type="cylinder" rgba="1 0 0 1" 
+          quat="{axis_to_quat(np.array([0, 0, 1]), R[:, 0])}"/>
+    
+    <site name="target_y_axis" pos="{target_pos[0]} {target_pos[1]} {target_pos[2]}" 
+          size="0.001 0.03 0.001" type="cylinder" rgba="0 1 0 1" 
+          quat="{axis_to_quat(np.array([0, 0, 1]), R[:, 1])}"/>
+    
+    <site name="target_z_axis" pos="{target_pos[0]} {target_pos[1]} {target_pos[2]}" 
+          size="0.001 0.03 0.001" type="cylinder" rgba="0 0 1 1" 
+          quat="{axis_to_quat(np.array([0, 0, 1]), R[:, 2])}"/>
+    
+    <!-- Line connecting target position and current position -->
+    <site name="target_line" pos="0 0 0" size="0.001 0.001 0.001" type="cylinder" rgba="1 1 0 0.5"/>
+    """
+    
+    # Insert before the closing worldbody tag
+    xml_with_target = model_xml[:worldbody_end] + target_sites + model_xml[worldbody_end:]
+    return xml_with_target
 
-def quaternion_to_euler(quat):
-    """Convert quaternion to ZYZ Euler angles.
+def axis_to_quat(vec1, vec2):
+    """
+    Calculate quaternion representing rotation between two unit vectors
+    Shows rotation from vec1 to vec2
     
     Args:
-        quat: Quaternion [w, x, y, z]
+        vec1: First unit vector
+        vec2: Second unit vector
         
     Returns:
-        Euler angles [alpha, beta, gamma] (ZYZ convention)
+        Quaternion as string "w x y z"
     """
-    quat = normalize_quaternion(quat)
-    w, x, y, z = quat
+    # Normalize vectors
+    vec1 = vec1 / np.linalg.norm(vec1)
+    vec2 = vec2 / np.linalg.norm(vec2)
     
-    # Compute Euler angles
-    # atan2(2(wx+yz), 1-2(x²+y²)) -> first angle alpha
-    # acos(1-2(x²+z²)) -> second angle beta
-    # atan2(2(wz+xy), 1-2(y²+z²)) -> third angle gamma
+    # Calculate dot product and cross product
+    dot_product = np.dot(vec1, vec2)
+    cross_product = np.cross(vec1, vec2)
     
-    alpha = np.arctan2(2*(w*z + x*y), 1 - 2*(y*y + z*z))
+    # Special case: vectors are parallel (same or opposite direction)
+    if np.isclose(dot_product, 1.0):
+        return "1 0 0 0"  # Identity quaternion (no rotation)
+    elif np.isclose(dot_product, -1.0):
+        # 180-degree rotation - choose any perpendicular axis
+        perp = np.array([1, 0, 0]) if not np.allclose(vec1, [1, 0, 0]) else np.array([0, 1, 0])
+        perp = perp - vec1 * np.dot(perp, vec1)
+        perp = perp / np.linalg.norm(perp)
+        return f"0 {perp[0]} {perp[1]} {perp[2]}"
+        
+    # Calculate rotation angle
+    angle = np.arccos(np.clip(dot_product, -1.0, 1.0))
     
-    # Handle numerical issues for beta
-    beta_val = 2*(w*y - x*z)
-    beta_val = np.clip(beta_val, -1.0, 1.0)
-    beta = np.arcsin(beta_val)
+    # Calculate rotation axis (normalized cross product)
+    axis = cross_product / np.linalg.norm(cross_product)
     
-    gamma = np.arctan2(2*(w*x + y*z), 1 - 2*(x*x + y*y))
+    # Calculate quaternion components
+    w = np.cos(angle / 2)
+    xyz = axis * np.sin(angle / 2)
     
-    # Keep angles in [-pi, pi] range
-    alpha = ((alpha + np.pi) % (2 * np.pi)) - np.pi
-    beta = ((beta + np.pi) % (2 * np.pi)) - np.pi
-    gamma = ((gamma + np.pi) % (2 * np.pi)) - np.pi
-    
-    return np.array([alpha, beta, gamma])
+    return f"{w} {xyz[0]} {xyz[1]} {xyz[2]}"
 
-def rotation_matrix_to_quaternion(R):
-    """Convert rotation matrix to quaternion [w, x, y, z].
+def update_target_line(model, data, ee_pos, target_pos):
+    """
+    Update the line connecting end effector to target
     
     Args:
-        R: 3x3 rotation matrix
-        
-    Returns:
-        Quaternion [w, x, y, z]
+        model: MuJoCo model
+        data: MuJoCo data
+        ee_pos: End effector position [x, y, z]
+        target_pos: Target position [x, y, z]
     """
-    trace = R[0, 0] + R[1, 1] + R[2, 2]
+    # Get site ID
+    line_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "target_line")
+    if line_id == -1:
+        return  # Site not found, do nothing
     
-    if trace > 0:
-        S = np.sqrt(trace + 1.0) * 2
-        w = 0.25 * S
-        x = (R[2, 1] - R[1, 2]) / S
-        y = (R[0, 2] - R[2, 0]) / S
-        z = (R[1, 0] - R[0, 1]) / S
-    elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
-        S = np.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2]) * 2
-        w = (R[2, 1] - R[1, 2]) / S
-        x = 0.25 * S
-        y = (R[0, 1] + R[1, 0]) / S
-        z = (R[0, 2] + R[2, 0]) / S
-    elif R[1, 1] > R[2, 2]:
-        S = np.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2]) * 2
-        w = (R[0, 2] - R[2, 0]) / S
-        x = (R[0, 1] + R[1, 0]) / S
-        y = 0.25 * S
-        z = (R[1, 2] + R[2, 1]) / S
-    else:
-        S = np.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1]) * 2
-        w = (R[1, 0] - R[0, 1]) / S
-        x = (R[0, 2] + R[2, 0]) / S
-        y = (R[1, 2] + R[2, 1]) / S
-        z = 0.25 * S
+    # Calculate midpoint and direction
+    midpoint = (ee_pos + target_pos) / 2
+    direction = target_pos - ee_pos
+    length = np.linalg.norm(direction)
     
-    return normalize_quaternion(np.array([w, x, y, z]))
-
-def quaternion_to_rotation_matrix(quat):
-    """Convert quaternion to rotation matrix.
+    if length < 1e-6:
+        return  # Distance too small, don't update
     
-    Args:
-        quat: Quaternion [w, x, y, z]
-        
-    Returns:
-        3x3 rotation matrix
-    """
-    quat = normalize_quaternion(quat)
-    w, x, y, z = quat
+    # Set line position
+    model.site_pos[line_id] = midpoint
     
-    return np.array([
-        [1 - 2*y*y - 2*z*z,  2*x*y - 2*z*w,     2*x*z + 2*y*w],
-        [2*x*y + 2*z*w,      1 - 2*x*x - 2*z*z, 2*y*z - 2*x*w],
-        [2*x*z - 2*y*w,      2*y*z + 2*x*w,     1 - 2*x*x - 2*y*y]
-    ])
-
-def quaternion_multiply(q1, q2):
-    """Multiply two quaternions.
+    # Set line size - MuJoCo API needs three values
+    model.site_size[line_id] = np.array([0.001, length/2, 0.001])
     
-    Args:
-        q1: First quaternion [w, x, y, z]
-        q2: Second quaternion [w, x, y, z]
-        
-    Returns:
-        Result quaternion [w, x, y, z]
-    """
-    w1, x1, y1, z1 = q1
-    w2, x2, y2, z2 = q2
+    # Set line direction (convert to unit vector)
+    direction = direction / length
     
-    w = w1*w2 - x1*x2 - y1*y2 - z1*z2
-    x = w1*x2 + x1*w2 + y1*z2 - z1*y2
-    y = w1*y2 - x1*z2 + y1*w2 + z1*x2
-    z = w1*z2 + x1*y2 - y1*x2 + z1*w2
-    
-    return np.array([w, x, y, z])
-
-def quaternion_conjugate(q):
-    """Return the conjugate of a quaternion.
-    
-    Args:
-        q: Quaternion [w, x, y, z]
-        
-    Returns:
-        Conjugate quaternion [w, -x, -y, -z]
-    """
-    return np.array([q[0], -q[1], -q[2], -q[3]])
-
-def normalize_quaternion(q):
-    """Normalize a quaternion to unit length.
-    
-    Args:
-        q: Quaternion [w, x, y, z]
-        
-    Returns:
-        Normalized quaternion
-    """
-    norm = np.linalg.norm(q)
-    if norm < 1e-10:
-        return np.array([1.0, 0.0, 0.0, 0.0])  # Default to identity quaternion
-    return q / norm
+    # Calculate rotation from Z-axis to target direction
+    quat_str = axis_to_quat(np.array([0, 0, 1]), direction)
+    quat_vals = np.array([float(x) for x in quat_str.split()])
+    model.site_quat[line_id] = quat_vals
 
 ###############################################################################
-# 2) Forward Kinematics
+# Main Demo Function
 ###############################################################################
-def forward_kinematics(thetas, return_quaternion=False):
+def run_robot_demo(target_pos, target_orientation, output_file="robot_euler_ik.mp4"):
     """
-    Compute forward kinematics using MyCobot DH parameters.
+    Run robot arm demo visualizing target position and orientation
+    using the diff_ik algorithm with quaternion internal representation
     
     Args:
-        thetas: Joint angles [theta1, theta2, theta3, theta4, theta5, theta6]
-        return_quaternion: If True, returns quaternion instead of Euler angles
+        target_pos: Target position [x, y, z]
+        target_orientation: Target orientation as Euler angles [alpha, beta, gamma]
+        output_file: Output video file path
         
     Returns:
-        If return_quaternion is True:
-            End-effector pose [x, y, z, qw, qx, qy, qz]
-        Otherwise:
-            End-effector pose [x, y, z, alpha, beta, gamma]
+        True if successful, False otherwise
     """
-    # Apply joint angle transformations
-    t1 = thetas[0] 
-    t2 = thetas[1] - np.pi/2
-    t3 = thetas[2]
-    t4 = thetas[3] - np.pi/2
-    t5 = thetas[4] + np.pi/2
-    t6 = thetas[5]
+    # Remove temporary files
+    temp_model_path = "temp_model_with_target.xml"
+    if os.path.exists(temp_model_path):
+        try:
+            os.remove(temp_model_path)
+            print("Removed previous temporary file")
+        except Exception as e:
+            print(f"Error removing temporary file: {e}")
     
-    # DH parameters (a, alpha, d, theta)
-    dh_params = [
-        (0,       np.pi/2, 0.15708, t1),
-        (-0.1104, 0,       0,       t2),
-        (-0.096,  0,       0,       t3),
-        (0,       np.pi/2, 0.06639, t4),
-        (0,      -np.pi/2, 0.07318, t5),
-        (0,       0,       0.0456,  t6)
-    ]
-    
-    # Calculate transformation matrix
-    T = np.eye(4)
-    for (a, alpha, d, theta) in dh_params:
-        T = T @ dh_transform(a, alpha, d, theta)
-    
-    # Extract position
-    position = T[:3, 3]
-    
-    # Extract orientation
-    rotation_matrix = T[:3, :3]
-    quaternion = rotation_matrix_to_quaternion(rotation_matrix)
-    
-    if return_quaternion:
-        # Return position and quaternion
-        return np.concatenate([position, quaternion])
-    else:
-        # Convert quaternion to Euler angles
-        euler = quaternion_to_euler(quaternion)
-        # Return position and Euler angles
-        return np.concatenate([position, euler])
-
-###############################################################################
-# 3) Jacobian and Inverse Kinematics
-###############################################################################
-def basic_jacobian(thetas):
-    """
-    Compute the geometric Jacobian matrix for the manipulator.
-    
-    Args:
-        thetas: Joint angles [theta1, theta2, theta3, theta4, theta5, theta6]
-        
-    Returns:
-        6x6 Jacobian matrix [J_v; J_w]
-    """
-    # Calculate end-effector pose with quaternion
-    ee_pose = forward_kinematics(thetas, return_quaternion=True)
-    ee_pos = ee_pose[:3]
-    
-    # Apply joint angle transformations
-    t1 = thetas[0] 
-    t2 = thetas[1] - np.pi/2
-    t3 = thetas[2]
-    t4 = thetas[3] - np.pi/2
-    t5 = thetas[4] + np.pi/2
-    t6 = thetas[5]
-    
-    # DH parameters (a, alpha, d, theta)
-    dh_params = [
-        (0,       np.pi/2, 0.15708, t1),
-        (-0.1104, 0,       0,       t2),
-        (-0.096,  0,       0,       t3),
-        (0,       np.pi/2, 0.06639, t4),
-        (0,      -np.pi/2, 0.07318, t5),
-        (0,       0,       0.0456,  t6)
-    ]
-    
-    # Calculate transformation matrices up to each joint
-    T = np.eye(4)
-    trans_matrices = [T.copy()]  # T_0 for i=0
-    
-    for (a, alpha, d, theta) in dh_params:
-        T_step = dh_transform(a, alpha, d, theta)
-        T = T @ T_step
-        trans_matrices.append(T.copy())
-    
-    # Calculate Jacobian
-    jacobian = np.zeros((6, 6))
-    
-    for i in range(6):
-        # Get position and z-axis of previous frame
-        T_prev = trans_matrices[i]
-        pos_prev = T_prev[:3, 3]
-        z_axis_prev = T_prev[:3, 2]  # z-axis of the joint frame
-        
-        # Linear velocity component (J_v)
-        jacobian[:3, i] = np.cross(z_axis_prev, ee_pos - pos_prev)
-        
-        # Angular velocity component (J_w)
-        jacobian[3:, i] = z_axis_prev
-    
-    return jacobian
-
-def quaternion_error(q1, q2):
-    """Calculate quaternion error for control (q2 - q1).
-    
-    Args:
-        q1: Current quaternion [w, x, y, z]
-        q2: Target quaternion [w, x, y, z]
-        
-    Returns:
-        3D angular velocity error vector
-    """
-    # Normalize quaternions
-    q1 = normalize_quaternion(q1)
-    q2 = normalize_quaternion(q2)
-    
-    # Calculate quaternion error qe = q2 * q1*
-    q1_conj = quaternion_conjugate(q1)
-    qe = quaternion_multiply(q2, q1_conj)
-    
-    # Check if the rotation is the long way around
-    if qe[0] < 0:
-        qe = -qe  # Take the shorter path
-    
-    # Extract the error vector (imaginary part)
-    # For small rotations, the vector part of the quaternion
-    # is approximately half the angular velocity vector
-    error_vector = 2.0 * qe[1:4]
-    
-    return error_vector
-
-def inverse_kinematics_step(thetas, target_pose, max_angvel=1.0, target_is_quaternion=False):
-    """
-    Perform a single step of inverse kinematics calculation.
-    
-    Args:
-        thetas: Current joint angles
-        target_pose: Target pose [x, y, z, ...] with orientation as either:
-                     - Euler angles [alpha, beta, gamma] (if target_is_quaternion=False)
-                     - Quaternion [qw, qx, qy, qz] (if target_is_quaternion=True)
-        max_angvel: Maximum allowed joint angular velocity
-        target_is_quaternion: Whether target_pose contains quaternion (True) or Euler angles (False)
-        
-    Returns:
-        Joint velocities (dq)
-    """
-    # Get current pose with quaternion
-    current_pose = forward_kinematics(thetas, return_quaternion=True)
-    
-    # Split position and orientation
-    current_pos = current_pose[:3]
-    current_quat = current_pose[3:7]
-    
-    target_pos = target_pose[:3]
-    
-    # Convert target orientation to quaternion if needed
-    if target_is_quaternion:
-        target_quat = target_pose[3:7]
-    else:
-        # Target pose contains Euler angles
-        target_euler = target_pose[3:6]
-        target_quat = euler_to_quaternion(target_euler)
-    
-    # Calculate position error
-    pos_error = target_pos - current_pos
-    
-    # Calculate orientation error (as angular velocity)
-    orient_error = quaternion_error(current_quat, target_quat)
-    
-    # Combine position and orientation errors
-    error = np.concatenate([pos_error, orient_error])
-    
-    # Get Jacobian
-    J = basic_jacobian(thetas)
-    
-    # Calculate joint velocities using pseudoinverse (without damping)
-    # Simple pseudoinverse: J⁺ = J^T(JJ^T)^(-1)
-    J_pinv = np.linalg.pinv(J)
-    dq = J_pinv @ error
-    
-    # Limit maximum joint velocity if specified
-    if max_angvel > 0:
-        dq_abs_max = np.abs(dq).max()
-        if dq_abs_max > max_angvel:
-            dq *= max_angvel / dq_abs_max
-    
-    return dq
-
-def set_joint_angles(data, thetas):
-    """Set joint angles in the MuJoCo simulation.
-    
-    Args:
-        data: MuJoCo simulation data
-        thetas: Joint angles to set
-    """
-    for i in range(len(thetas)):
-        data.qpos[i] = thetas[i]
-
-def create_robot_model_with_mocap():
-    """Create and save a MuJoCo model with a mocap body for mouse control.
-    
-    Returns:
-        Path to the created model file
-    """
-    # Get original model path
-    original_model_path = "config/xml/mycobot_280jn_mujoco.xml"
-    
-    # Create a modified version with a mocap body
-    mocap_model_path = "config/xml/mycobot_280jn_mujoco_with_mocap.xml"
-    
-    # Check if the modified model already exists
-    if os.path.exists(mocap_model_path):
-        print(f"Using existing model with mocap: {mocap_model_path}")
-        return mocap_model_path
-    
+    # Find XML file path
     try:
-        # Make sure the directory exists
-        os.makedirs(os.path.dirname(mocap_model_path), exist_ok=True)
+        script_dir = Path(__file__).resolve().parent
+        model_path = script_dir / "config" / "xml" / "mycobot_280jn_mujoco.xml"
+        if not model_path.exists():
+            # Also search in current directory
+            model_path = Path("config/xml/mycobot_280jn_mujoco.xml")
+            if not model_path.exists():
+                raise FileNotFoundError("Model XML file not found")
         
-        # Load the original model
-        model = mujoco.MjModel.from_xml_path(original_model_path)
-        
-        # Get the end-effector position for mocap body placement
-        data = mujoco.MjData(model)
-        mujoco.mj_forward(model, data)
-        ee_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "joint6_flange")
-        ee_pos = data.xpos[ee_body_id].copy()
-        
-        # Create a modified XML with a mocap body
-        xml_content = f"""
-<mujoco model="mycobot_with_mocap">
-    <include file="{original_model_path}"/>
-    
-    <worldbody>
-        <body name="target" mocap="true" pos="{ee_pos[0]} {ee_pos[1]} {ee_pos[2]}">
-            <geom type="sphere" size="0.02" rgba="1 0 0 0.5"/>
-        </body>
-    </worldbody>
-</mujoco>
-"""
-        # Write the modified XML
-        with open(mocap_model_path, "w") as f:
-            f.write(xml_content)
-        
-        print(f"Created model with mocap body: {mocap_model_path}")
-        return mocap_model_path
-    
+        model_path = str(model_path)
     except Exception as e:
-        print(f"Error creating model with mocap: {e}")
-        print("Using original model instead")
-        return original_model_path
+        print(f"Error searching for model path: {e}")
+        return False
+    
+    # Load robot model
+    try:
+        # Load XML as string
+        with open(model_path, 'r') as f:
+            model_xml = f.read()
+        
+        # Fix mesh directory path if needed
+        script_dir = Path(__file__).resolve().parent
+        mesh_dir = script_dir / "config" / "meshes_mujoco"
+        
+        if not mesh_dir.exists():
+            # Search in current directory
+            mesh_dir = Path("config/meshes_mujoco")
+            if not mesh_dir.exists():
+                print(f"Warning: Mesh directory not found: {mesh_dir}")
+        else:
+            # Convert to absolute path
+            mesh_dir = str(mesh_dir.absolute())
+            
+            # Replace meshdir attribute with correct path
+            if 'meshdir=' in model_xml:
+                start_idx = model_xml.find('meshdir=') + 9  # Length of 'meshdir="' is 9
+                end_idx = model_xml.find('"', start_idx)
+                old_meshdir = model_xml[start_idx:end_idx]
+                
+                # Replace with new path
+                model_xml = model_xml.replace(f'meshdir="{old_meshdir}"', f'meshdir="{mesh_dir}"')
+        
+        # Add target visualization elements
+        model_xml = add_target_visualization(model_xml, target_pos, target_orientation)
+        
+        # Save to temporary file
+        with open(temp_model_path, 'w') as f:
+            f.write(model_xml)
+        
+        # Load modified model
+        model = mujoco.MjModel.from_xml_path(temp_model_path)
+        data = mujoco.MjData(model)
+    except Exception as e:
+        print(f"Error configuring model: {e}")
+        return False
+    
+    # Configure rendering
+    try:
+        render_width, render_height = 1920, 1088
+        model.vis.global_.offwidth = render_width
+        model.vis.global_.offheight = render_height
+        
+        renderer = mujoco.Renderer(model, render_height, render_width)
+        renderer.enable_shadows = True
+    except Exception as e:
+        print(f"Error configuring renderer: {e}")
+        return False
+    
+    # Set initial conditions
+    ee_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "joint6_flange")
+    
+    # Set initial joint angles with small random perturbation like in diff_ik.py
+    thetas_init = np.zeros(6, dtype=float) + np.random.uniform(-0.1, 0.1, size=6)
+    set_joint_angles(data, thetas_init)
+    mujoco.mj_forward(model, data)
+    
+    # Get initial pose
+    initial_pose = forward_kinematics(thetas_init, return_quaternion=False)
+    
+    # Define target position and orientation using Euler angles
+    # This section follows diff_ik.py exactly
+    # Define target orientation
+    target_euler = initial_pose[3:6].copy()
+    target_euler[0] += np.pi/2  # Add 90 degrees to alpha (first rotation around Z)
+    
+    # Use command line args if provided (otherwise use the default rotation)
+    if not np.allclose(target_orientation, np.zeros(3)):
+        target_euler = target_orientation
+        
+    # Combine target position and orientation into a full target pose
+    target_pose = np.concatenate([target_pos, target_euler])
+    
+    # Simulation settings
+    n_steps = 500          # Total steps
+    
+    # Simulation settings
+    dt = 0.02                # Simulation timestep (s)
+    integration_dt = 0.02    # Integration timestep (s)
+    max_angvel = 1.0         # Maximum joint angular velocity (rad/s)
+    
+    # Initialize frames and logs
+    frames = []
+    joint_angle_log = []
+    ee_pos_log = []
+    ee_euler_log = []
+    
+    print("\nStarting motion to target pose using diff_ik algorithm.")
+    print(f"Initial pose: Position {initial_pose[:3]}, Euler angles {initial_pose[3:6]} (rad)")
+    print(f"Target pose: Position {target_pose[:3]}, Euler angles {target_pose[3:6]} (rad)")
+    
+    current_thetas = thetas_init.copy()
+    
+    for i in range(n_steps):
+        step_start = time.time()
+        
+        # Calculate one step of inverse kinematics (using Euler angles as target)
+        # Directly using target_pose - exactly like in diff_ik.py
+        dq = inverse_kinematics_step(current_thetas, target_pose, max_angvel, target_is_quaternion=False)
+        
+        # Integrate joint velocities to update joint angles
+        q = current_thetas.copy()
+        mujoco.mj_integratePos(model, q, dq, integration_dt)
+        
+        # Update current joint angles
+        current_thetas = q
+        
+        # Apply joint angles to the simulation
+        set_joint_angles(data, current_thetas)
+        mujoco.mj_forward(model, data)
+        
+        # Get current end-effector position from MuJoCo
+        mujoco_ee_pos = data.xpos[ee_body_id]
+        
+        # Get current end-effector pose from our FK calculation
+        our_ee_pose = forward_kinematics(current_thetas, return_quaternion=False)
+        our_ee_pos = our_ee_pose[:3]
+        our_ee_euler = our_ee_pose[3:6]
+        
+        # Update the target line visualization
+        update_target_line(model, data, mujoco_ee_pos, target_pos)
+        
+        # Calculate errors
+        pos_diff = np.linalg.norm(mujoco_ee_pos - our_ee_pos)
+        pos_err = np.linalg.norm(target_pos - our_ee_pos)
+        
+        # Calculate orientation error using quaternions internally
+        our_ee_quat = euler_to_quaternion(our_ee_euler)
+        target_quat = euler_to_quaternion(target_pose[3:6])
+        orient_err = np.linalg.norm(quaternion_error(our_ee_quat, target_quat))
+        
+        # Record logs
+        joint_angle_log.append(current_thetas.copy())
+        ee_pos_log.append(our_ee_pos.copy())
+        ee_euler_log.append(our_ee_euler.copy())
+        
+        # Render the scene
+        renderer.update_scene(data)
+        frames.append(renderer.render())
+        
+        # Display progress
+        print(f"Step {i+1}/{n_steps} | "
+              f"Pos err: {pos_err:.5f}, "
+              f"Orient err: {orient_err:.5f}, "
+              f"MuJoCo-Our diff: {pos_diff:.5f}")
+        
+        # Adjust timing to maintain real-time simulation
+        time_until_next_step = dt - (time.time() - step_start)
+        if time_until_next_step > 0:
+            time.sleep(time_until_next_step)
+    
+    # Save video
+    try:
+        print(f"Saving video to '{output_file}'...")
+        imageio.mimsave(output_file, frames, fps=60, quality=10, bitrate="32M")
+        print("Video saved.")
+    except Exception as e:
+        print(f"Error saving video: {e}")
+        return False
+    
+    # Save logs
+    log_file = os.path.splitext(output_file)[0] + "_logs.npz"
+    try:
+        np.savez(log_file,
+                 target_position=target_pos,
+                 target_orientation=target_orientation,
+                 joint_angles=np.array(joint_angle_log),
+                 ee_positions=np.array(ee_pos_log),
+                 ee_euler_angles=np.array(ee_euler_log))
+        print(f"Logs saved to '{log_file}'.")
+    except Exception as e:
+        print(f"Error saving logs: {e}")
+    
+    # Cleanup
+    renderer.close()
+    if os.path.exists(temp_model_path):
+        os.remove(temp_model_path)
+    
+    return True
 
 ###############################################################################
-# 4) Main Demo with Keyboard Control
+# Main Function
 ###############################################################################
 def main():
-    """Main function to demonstrate robot control with keyboard control."""
-    try:
-        # Load the MuJoCo model - first try to create a version with mocap, fallback to original
-        model_path = "config/xml/mycobot_280jn_mujoco.xml"
-        has_mocap = False
-        
-        try:
-            # Look for an existing mocap body in the model
-            model = mujoco.MjModel.from_xml_path(model_path)
-            for i in range(model.nbody):
-                if model.body_mocapid[i] >= 0:
-                    has_mocap = True
-                    break
-            
-            # If no mocap body exists, try to create one
-            if not has_mocap:
-                modified_model_path = model_path.replace(".xml", "_with_mocap.xml")
-                
-                # Create a simple XML with the mocap body included
-                xml_content = f"""
-<mujoco>
-    <include file="{model_path}"/>
-    <worldbody>
-        <body name="target" mocap="true" pos="0.1 0 0.3">
-            <geom type="sphere" size="0.02" rgba="1 0 0 0.5"/>
-        </body>
-    </worldbody>
-</mujoco>
-"""
-                with open(modified_model_path, "w") as f:
-                    f.write(xml_content)
-                
-                model_path = modified_model_path
-                has_mocap = True
-                print(f"Created temporary model with mocap: {model_path}")
-        except:
-            print("Could not add mocap body, using key controls instead")
-        
-        # Load the model
-        model = mujoco.MjModel.from_xml_path(model_path)
-        data = mujoco.MjData(model)
-        
-        # Simulation settings
-        dt = 0.002             # Simulation timestep (s)
-        integration_dt = 0.1   # Integration timestep (s)
-        max_angvel = 1.0       # Maximum joint angular velocity (rad/s)
-        
-        # Set initial joint angles
-        thetas_init = np.zeros(6, dtype=float)
-        set_joint_angles(data, thetas_init)
-        mujoco.mj_forward(model, data)
-        
-        # Get the end-effector body ID
-        ee_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "joint6_flange")
-        
-        # Find mocap body if exists
-        mocap_id = -1
-        mocap_body_name = ""
-        for i in range(model.nbody):
-            if model.body_mocapid[i] >= 0:
-                mocap_id = model.body_mocapid[i]
-                mocap_body_name = model.body(i).name
-                break
-        
-        has_mocap = mocap_id >= 0
-        if has_mocap:
-            print(f"Found mocap body '{mocap_body_name}' (ID: {mocap_id})")
-        else:
-            print("No mocap body found, using keyboard control")
-        
-        # Launch the passive viewer
-        with mujoco.viewer.launch_passive(model=model, data=data, show_left_ui=True, show_right_ui=True) as viewer:
-            # Get initial pose with Euler angles
-            initial_pose = forward_kinematics(thetas_init, return_quaternion=False)
-            print(f"Initial pose: Position {initial_pose[:3]}, Euler angles {initial_pose[3:6]} (rad)")
-            
-            # Initialize current joint angles
-            current_thetas = thetas_init.copy()
-            
-            # Initialize target pose with initial position and orientation
-            target_pose = np.zeros(6)
-            target_pose[:3] = initial_pose[:3].copy()
-            target_pose[3:6] = initial_pose[3:6].copy()  # Keep initial orientation
-            
-            # Set mocap body to initial position if available
-            if has_mocap:
-                data.mocap_pos[mocap_id] = target_pose[:3]
-                print("Click and drag the red sphere to move the target")
-            else:
-                print("Use keyboard to move the target:")
-                print("  - Up/Down/Left/Right/PgUp/PgDn: Move target")
-                print("  - Hold Shift: Move faster")
-            
-            print("Press ESC to exit")
-            
-            # Target movement speed (units per second)
-            move_speed = 0.1
-            
-            # Start the simulation loop
-            while viewer.is_running():
-                step_start = time.time()
-                
-                # Handle target position control
-                if has_mocap:
-                    # Use mocap body position as target
-                    target_pose[:3] = data.mocap_pos[mocap_id]
-                else:
-                    # Use keyboard control
-                    key_step = move_speed * dt
-                    
-                    # Handle key presses for target movement
-                    # Note: This is a simplified approach since direct key state access
-                    # is not available in the Python bindings
-                    
-                    # Instead, we'll just move the target in a pattern to demonstrate
-                    t = data.time
-                    target_pose[0] = initial_pose[0] + 0.1 * np.sin(t * 0.5)
-                    target_pose[1] = initial_pose[1] + 0.1 * np.cos(t * 0.5)
-                    target_pose[2] = initial_pose[2] + 0.05 * np.sin(t * 0.3)
-                
-                # Calculate one step of inverse kinematics (using Euler angles as target)
-                dq = inverse_kinematics_step(current_thetas, target_pose, max_angvel, target_is_quaternion=False)
-                
-                # Integrate joint velocities to update joint angles
-                q = current_thetas.copy()
-                mujoco.mj_integratePos(model, q, dq, integration_dt)
-                
-                # Update current joint angles
-                current_thetas = q
-                
-                # Apply joint angles to the simulation
-                set_joint_angles(data, current_thetas)
-                mujoco.mj_step(model, data)
-                
-                # Get current end-effector pose
-                our_ee_pose = forward_kinematics(current_thetas, return_quaternion=False)
-                our_ee_pos = our_ee_pose[:3]
-                our_ee_euler = our_ee_pose[3:6]
-                
-                # Get MuJoCo's end-effector position
-                mujoco_ee_pos = data.xpos[ee_body_id]
-                
-                # Calculate errors
-                pos_err = np.linalg.norm(target_pose[:3] - our_ee_pos)
-                pos_diff = np.linalg.norm(mujoco_ee_pos - our_ee_pos)
-                
-                # Calculate orientation error using quaternions internally
-                our_ee_quat = euler_to_quaternion(our_ee_euler)
-                target_quat = euler_to_quaternion(target_pose[3:6])
-                orient_err = np.linalg.norm(quaternion_error(our_ee_quat, target_quat))
-                
-                # Update the viewer
-                viewer.sync()
-                
-                # Print status every 100 steps
-                if int(data.time / dt) % 100 == 0:
-                    print(f"Time: {data.time:.2f}s | "
-                          f"Target pos: [{target_pose[0]:.3f}, {target_pose[1]:.3f}, {target_pose[2]:.3f}] | "
-                          f"Pos err: {pos_err:.5f}")
-                
-                # Adjust timing to maintain real-time simulation
-                time_until_next_step = dt - (time.time() - step_start)
-                if time_until_next_step > 0:
-                    time.sleep(time_until_next_step)
-        
-        print("Simulation ended.")
-        
-    except Exception as e:
-        print(f"An error occurred: {e}")
-        import traceback
-        traceback.print_exc()
+    """
+    Main function to parse command line arguments and run the demo
+    """
+    parser = argparse.ArgumentParser(description='Robot arm demo using diff_ik algorithm - Visualizing target position and orientation')
+    
+    # Target position arguments
+    parser.add_argument('--x', type=float, default=0.05826, help='Target position X (default: 0.06026)')
+    parser.add_argument('--y', type=float, default=-0.2752, help='Target position Y (default: -0.2752)')
+    parser.add_argument('--z', type=float, default=0.1566 , help='Target position Z (default: 0.0566)')
+    
+    # Target orientation arguments (in radians)
+    parser.add_argument('--alpha', type=float, default=np.pi/4, 
+                        help='Target orientation Alpha - first Euler angle (default: pi/2)')
+    parser.add_argument('--beta', type=float, default=0.0, 
+                        help='Target orientation Beta - second Euler angle (default: 0.0)')
+    parser.add_argument('--gamma', type=float, default=0.0, 
+                        help='Target orientation Gamma - third Euler angle (default: 0.0)')
+    
+    # Output file
+    parser.add_argument('--output', type=str, default="robot_quat_ik.mp4", 
+                        help='Output video file (default: robot_quat_ik.mp4)')
+    
+    args = parser.parse_args()
+    
+    # Create target position and orientation arrays
+    target_pos = np.array([args.x, args.y, args.z])
+    target_orientation = np.array([args.alpha, args.beta, args.gamma])
+    
+    # Run the demo
+    success = run_robot_demo(target_pos, target_orientation, args.output)
+    
+    if success:
+        print("Demo completed successfully")
+    else:
+        print("Error occurred during demo execution")
 
 if __name__ == "__main__":
     main()
-
-
-
-# DHパラメータの求め方．せ
-
-
-
-
-# 図\ref{fig:mycobot_dh_parameter_coordinate_setting}に示すとおり，
-# MyCobotは
-# 6自由度の回転関節（Revolute関節）から構成され，リンク$i$に対応する関節角を $\theta_i$ とする．
-# ロボットアームの幾何構造を定式化する際には，「隣接するリンク同士がどのように並んでいるか」
-# および「関節軸がどの方向を向いているか」を明示し，
-# 連鎖的な座標変換を定義する必要がある．
-
-# このとき，座標系の付け方に一定の規則を与えて各リンク間の相対変位を表すと，
-# \textbf{Denavit–Hartenberg (DH) パラメータ} を用いて変換を簡潔にまとめることができる．
-# 一般に，3次元空間で二つの座標系間を任意に変換するには6つのパラメータが必要だが，
-# ロボットマニピュレータの場合には単一軸の回転あるいは平行移動が連結しているだけなので，
-# 4種類のパラメータ
-# \[
-#  (a_i,\, \alpha_i,\, d_i,\, \theta_i)
-# \]
-# によってリンク$i-1$からリンク$i$への変換が表される．
-
-# DHパラメータの定義を厳密に行うために，以下の手順で座標系を配置する:
-# \begin{enumerate}
-#     \item 各関節の回転軸を $z_i$ 軸とする．
-#     \item 隣接する$z$軸を結ぶ最短距離線を$x_i$軸とし，$y_i$軸は右手系に従って決める．
-#     \item リンク長$a_i$やねじれ角$\alpha_i$，関節オフセット$d_i$，関節角$\theta_i$をDHパラメータとして割り当てる．
-# \end{enumerate}
-# 具体的にMyCobotについては，表\ref{tab:dh_params}にパラメータを示す．
-# これにしたがってリンク$i-1$座標系からリンク$i$座標系への同次変換行列は
-# \begin{equation}
-# {}^{i-1}\!T_{i}(\theta_i)
-# = 
-# \begin{pmatrix}
-#  \cos\theta_i & -\sin\theta_i \cos\alpha_{i-1} &  \sin\theta_i \sin\alpha_{i-1} & a_{i-1} \cos\theta_i \\
-#  \sin\theta_i &  \cos\theta_i \cos\alpha_{i-1} & -\cos\theta_i \sin\alpha_{i-1} & a_{i-1} \sin\theta_i \\
-#  0            &  \sin\alpha_{i-1}             &  \cos\alpha_{i-1}             & d_i \\
-#  0            &  0                             &  0                             & 1
-# \end{pmatrix}
-# \label{eq:DHtransform}
-# \end{equation}
-# で与えられる．
-
-# \begin{table}[H]
-# \centering
-# \caption{PUMA型ロボット（MyCobot）のDHパラメータ}
-# \label{tab:dh_params}
-# \begin{tabular}{c|cccc}
-# \hline
-# リンク $i$ & $a_{i-1}$ [mm] & $\alpha_{i-1}$ [rad] & $d_i$ [mm] & $\theta_i$ [rad] \\
-# \hline
-# 1 & 0 & $\frac{\pi}{2}$ & 131.56 & $\theta_1$ \\
-# 2 & -110.4 & 0 & 0 & $\theta_2$ \\
-# 3 & -96.0 & 0 & 0 & $\theta_3$ \\
-# 4 & 0 & $\frac{\pi}{2}$ & 66.39 & $\theta_4$ \\
-# 5 & 0 & $-\frac{\pi}{2}$ & 73.18 & $\theta_5$ \\
-# 6 & 0 & 0 & 0 & $\theta_6$ \\
-# \hline
-# \end{tabular}
-# \end{table}
-
-# \begin{figure}[H]
-#     \centering
-#     \includegraphics[width=0.8\linewidth]{figs/dh_parameter.pdf}
-#     \caption{MyCobotのDHパラメータ座標系の設定}
-#     \label{fig:mycobot_dh_parameter_coordinate_setting}
-# \end{figure}
