@@ -3,11 +3,9 @@
     <size njmax="500" nconmax="100" />
     <asset>
         <!-- 白色のマテリアルに変更 -->
-        <material name="robot_material" rgba="1 1 1 1"/> <!-- White -->
         <texture name="grid" type="2d" builtin="checker" rgb1=".1 .2 .3"
         rgb2=".2 .3 .4" width="300" height="300"/>
         <material name="grid" texture="grid" texrepeat="8 8" reflectance=".2"/>
-        <!-- <material name="target_material" rgba="1 0 0 1"/> 赤色の半透明なマーカー用マテリアル -->
         <mesh name="joint1_jet" file="joint1_jet.stl" />
         <mesh name="joint2" file="joint2.stl" />
         <mesh name="joint3" file="joint3.stl" />
@@ -20,8 +18,6 @@
         <geom size=".2 .2 .01" type="plane" material="grid"/>
         <light pos="0 0 .6"/>
         <camera name="closeup" pos="0 -.1 .10" xyaxes="1 0 0 0 1 2"/>    
-        <!-- <site name="target" pos="0.19425692 -0.18526572 0.2" size="0.01" type="sphere" material="target_material"/> -->
-        
         <geom quat="0.000796327 0 0 1" type="mesh" contype="0" conaffinity="0" group="1" mesh="joint1_jet" material="robot_material" />
         <geom quat="0.000796327 0 0 1" type="mesh" mesh="joint1_jet" material="robot_material" />
         <!-- Assign the robot_material to all geoms -->

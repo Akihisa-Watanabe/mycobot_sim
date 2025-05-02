@@ -284,15 +284,15 @@ def run_robot_demo(target_pos, target_orientation, output_file="robot_euler_ik.m
     # Define target position and orientation using Euler angles
     # This section follows diff_ik.py exactly
     # Define target orientation
-    target_euler = initial_pose[3:6].copy()
-    target_euler[0] += np.pi/2  # Add 90 degrees to alpha (first rotation around Z)
+    # target_euler = initial_pose[3:6].copy()
+    # target_euler[0] += np.pi/2  # Add 90 degrees to alpha (first rotation around Z)
     
-    # Use command line args if provided (otherwise use the default rotation)
-    if not np.allclose(target_orientation, np.zeros(3)):
-        target_euler = target_orientation
+    # # Use command line args if provided (otherwise use the default rotation)
+    # if not np.allclose(target_orientation, np.zeros(3)):
+    #     target_euler = target_orientation
         
     # Combine target position and orientation into a full target pose
-    target_pose = np.concatenate([target_pos, target_euler])
+    target_pose = np.concatenate([target_pos, target_orientation])
     
     # Simulation settings
     n_steps = 500          # Total steps
@@ -411,9 +411,9 @@ def main():
     parser = argparse.ArgumentParser(description='Robot arm demo using diff_ik algorithm - Visualizing target position and orientation')
     
     # Target position arguments
-    parser.add_argument('--x', type=float, default=0.05826, help='Target position X (default: 0.06026)')
+    parser.add_argument('--x', type=float, default=0.05826, help='Target position X (default: 0.05826)')
     parser.add_argument('--y', type=float, default=-0.2752, help='Target position Y (default: -0.2752)')
-    parser.add_argument('--z', type=float, default=0.1566 , help='Target position Z (default: 0.0566)')
+    parser.add_argument('--z', type=float, default=0.1566, help='Target position Z (default: 0.1566)')
     
     # Target orientation arguments (in radians)
     parser.add_argument('--alpha', type=float, default=np.pi/4, 
