@@ -2,7 +2,7 @@
     <compiler angle="radian" meshdir="../meshes_mujoco/" />
     <size njmax="500" nconmax="100" />
     <asset>
-        <!-- 白色のマテリアルに変更 -->
+        <material name="robot_material" rgba="1 1 1 1"/>
         <texture name="grid" type="2d" builtin="checker" rgb1=".1 .2 .3"
         rgb2=".2 .3 .4" width="300" height="300"/>
         <material name="grid" texture="grid" texrepeat="8 8" reflectance=".2"/>

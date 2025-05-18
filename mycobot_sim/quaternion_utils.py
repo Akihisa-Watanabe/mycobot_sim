@@ -1,12 +1,16 @@
 """
-Quaternion utilities – scalar-first convention  q = [w, x, y, z].
+Quaternion utilities (scalar–first convention: q = [w, x, y, z]).
 
-This file is intentionally self-contained so that other scripts can simply
-`import quaternion_utils as quat` and reuse the math functions.
+This module is self-contained so that other scripts can simply
+    import quaternion_utils as quat
+and reuse the mathematical helpers.
 """
 import numpy as np
 
 
+# ------------------------------------------------------------------ #
+# Basic quaternion algebra
+# ------------------------------------------------------------------ #
 def quat_mul(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
     """Quaternion product  q = q1 ⊗ q2."""
     w1, x1, y1, z1 = q1
@@ -26,20 +30,23 @@ def quat_conj(q: np.ndarray) -> np.ndarray:
 
 
 def rotvec(q: np.ndarray, v: np.ndarray) -> np.ndarray:
-    """Rotate a 3-vector `v` by quaternion `q`."""
+    """Rotate the 3-vector *v* by quaternion *q*."""
     qv = np.concatenate(([0.0], v))
     return quat_mul(quat_mul(q, qv), quat_conj(q))[1:]
 
 
+# ------------------------------------------------------------------ #
+# Optional helper (not used by the FK demo, but handy elsewhere)
+# ------------------------------------------------------------------ #
 def rotmat_to_quat(R: np.ndarray) -> np.ndarray:
-    """Convert a 3 × 3 rotation matrix into a unit quaternion (scalar first)."""
+    """Convert a 3 × 3 rotation matrix into a unit quaternion."""
     m00, m01, m02 = R[0]
     m10, m11, m12 = R[1]
     m20, m21, m22 = R[2]
 
-    trace = m00 + m11 + m22
-    if trace > 0.0:
-        s = 0.5 / np.sqrt(trace + 1.0)
+    tr = m00 + m11 + m22
+    if tr > 0.0:
+        s = 0.5 / np.sqrt(tr + 1.0)
         w = 0.25 / s
         x = (m21 - m12) * s
         y = (m02 - m20) * s
@@ -62,5 +69,4 @@ def rotmat_to_quat(R: np.ndarray) -> np.ndarray:
         x = (m02 + m20) / s
         y = (m12 + m21) / s
         z = 0.25 * s
-
     return np.array([w, x, y, z], dtype=float)
